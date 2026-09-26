@@ -1,22 +1,17 @@
 //! Основной игровой модуль Bevy: App, сборка сцены из ScenePlan,
-//! запуск Lua-хуков, интеграция UI паузы.
-//!
-//! Сцена строится упрощённо: примитивы (Plane/Cube/Sphere) + DirectionalLight/PointLight,
-//! а логика уровня обрабатывается Lua-скриптами (см. scripting::ScriptEngine).
+//! запуск Lua-хуков, интеграция UI паузы, чанковый стриминг.
 
 use bevy::prelude::*;
 
 use crate::level::build::{ColliderPlan, LightKindPlan, MeshKind, NodeKind, ScenePlan};
 use crate::scripting::ScriptEngine;
 
-/// Ресурс: активный план сцены (для интеграции с Lua и UI).
 #[derive(Resource, Default)]
 pub struct ActiveScene {
     pub plan: ScenePlanPlaceholder,
     pub level_number: u32,
 }
 
-/// Упрощённая «заглушка» — чтобы можно было хранить план как ресурс без Clone.
 #[derive(Default)]
 pub struct ScenePlanPlaceholder {
     pub loaded: bool,
@@ -34,18 +29,14 @@ impl From<&ScenePlan> for ScenePlanPlaceholder {
     }
 }
 
-/// Ресурс: игровой движок Lua-скриптов.
 pub struct LuaRuntime(pub std::sync::Mutex<ScriptEngine>);
 
-/// Компонент: маркер главной камеры.
 #[derive(Component)]
 pub struct MainCamera;
 
-/// Компонент: сущность узла сцены (соответствует id из XML).
 #[derive(Component, Debug, Clone)]
 pub struct SceneNodeId(pub String);
 
-/// Компонент: триггер уровня.
 #[derive(Component, Debug, Clone)]
 pub struct SceneTriggerId(pub String);
 
@@ -57,6 +48,7 @@ pub fn spawn_scene(
     plan: Res<ScenePlanResource>,
 ) {
     let plan = &plan.0;
+    let mut player_spawned = false;
 
     for node in &plan.nodes {
         let tf = Transform {
@@ -70,7 +62,6 @@ pub fn spawn_scene(
             scale: Vec3::new(node.scale[0], node.scale[1], node.scale[2]),
         };
 
-        // Свет — отдельно
         if node.kind == NodeKind::Light {
             if let Some((kind, color, intensity, range)) = &node.light {
                 let c = parse_hex_color(color);
@@ -101,7 +92,6 @@ pub fn spawn_scene(
                         ));
                     }
                     LightKindPlan::Spot => {
-                        // У Bevy SpotLight пока не в приоритете — эмулируем Point.
                         commands.spawn((
                             PointLight {
                                 color: c,
@@ -119,7 +109,6 @@ pub fn spawn_scene(
             }
         }
 
-        // Игрок — камера + маркер
         if node.kind == NodeKind::Player {
             commands.spawn((
                 Camera3dBundle {
@@ -133,16 +122,15 @@ pub fn spawn_scene(
                 MainCamera,
                 SceneNodeId(node.id.clone()),
             ));
+            player_spawned = true;
             continue;
         }
 
-        // Всё остальное — меш (или пустышка для коллайдера).
         let (mesh_handle, _is_plane) = match &node.mesh {
             Some(MeshKind::Plane) => (meshes.add(Plane3d::default().mesh().size(1.0, 1.0)), true),
             Some(MeshKind::Cube) | None => (meshes.add(Cuboid::new(1.0, 1.0, 1.0)), false),
             Some(MeshKind::Sphere) => (meshes.add(Sphere::new(0.5)), false),
             Some(MeshKind::Custom { .. }) => {
-                // OBJ-меш в этой версии упрощён — используем куб.
                 (meshes.add(Cuboid::new(1.0, 1.0, 1.0)), false)
             }
         };
@@ -167,7 +155,6 @@ pub fn spawn_scene(
             SceneNodeId(node.id.clone()),
         ));
 
-        // Коллайдер — пока логический маркер, физика отложена на интеграцию avian/rapier.
         if let Some(col) = &node.collider {
             ecmd.insert(ColliderMarker {
                 sensor: match col {
@@ -179,28 +166,94 @@ pub fn spawn_scene(
         }
     }
 
-    // Триггеры — просто маркеры (логика в Lua).
     for trg in &plan.triggers {
         commands.spawn((
             Transform::from_xyz(trg.pos[0], trg.pos[1], trg.pos[2]),
             SceneTriggerId(trg.id.clone()),
         ));
     }
+
+    // === FALLBACK: если игрок не был найден в плане — спавним камеру сами.
+    // Иначе Bevy не рендерит UI и сразу закрывает окно.
+    if !player_spawned {
+        eprintln!(
+            "[game] ВНИМАНИЕ: в ScenePlan нет узла kind=Player. \
+             Спавним fallback-камеру в (0, 2, 0). Проверь XML уровня — \
+             там должна быть сущность type=\"player\" (например player_start)."
+        );
+
+        // Ищем точку спавна из <spawn_point> — если есть, используем её координаты.
+        let spawn_pos = plan
+            .spawn_point
+            .as_ref()
+            .and_then(|id| plan.nodes.iter().find(|n| &n.id == id))
+            .map(|n| Vec3::new(n.pos[0], n.pos[1], n.pos[2]))
+            .unwrap_or(Vec3::new(0.0, 2.0, 0.0));
+
+        commands.spawn((
+            Camera3dBundle {
+                transform: Transform::from_translation(spawn_pos),
+                ..default()
+            },
+            crate::player::camera::FpsCamera::default(),
+            crate::player::Player::default(),
+            crate::player::Velocity3::default(),
+            crate::player::controller::Grounded(true),
+            MainCamera,
+            SceneNodeId("__fallback_camera__".into()),
+        ));
+
+        // И добавляем свет, чтобы не было совсем чёрно.
+        commands.spawn((
+            DirectionalLight {
+                illuminance: 5_000.0,
+                shadows_enabled: false,
+                ..default()
+            },
+            Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.5, 0.5, 0.0)),
+        ));
+
+        // И ambient, чтобы PBR-материалы были видны даже без источников света.
+        commands.insert_resource(AmbientLight {
+            color: Color::WHITE,
+            brightness: 200.0,
+        });
+
+        // И пол под ногами — чтобы было куда смотреть.
+        let floor_mesh = meshes.add(Plane3d::default().mesh().size(64.0, 64.0));
+        let floor_mat = materials.add(StandardMaterial {
+            base_color: Color::srgb(0.45, 0.40, 0.28),
+            ..default()
+        });
+        commands.spawn((
+            PbrBundle {
+                mesh: floor_mesh,
+                material: floor_mat,
+                transform: Transform::from_xyz(0.0, -0.5, 0.0),
+                ..default()
+            },
+        ));
+    }
+
+    // На всякий случай — если в плане вообще не было света, добавим ambient.
+    if plan.nodes.iter().all(|n| n.kind != NodeKind::Light) {
+        commands.insert_resource(AmbientLight {
+            color: Color::WHITE,
+            brightness: 100.0,
+        });
+    }
 }
 
-/// Маркер коллайдера (без реальной физики).
 #[derive(Component, Debug, Clone, Default)]
 pub struct ColliderMarker {
     pub sensor: bool,
 }
 
-/// Ресурс: план сцены (Arc, чтобы не копировать).
 #[derive(Resource)]
 pub struct ScenePlanResource(pub std::sync::Arc<ScenePlan>);
 
 impl Default for ScenePlanResource {
     fn default() -> Self {
-        // Пустой план по умолчанию.
         Self(std::sync::Arc::new(ScenePlan {
             spawn_point: None,
             gravity: [0.0, -9.81, 0.0],
@@ -217,7 +270,6 @@ impl Default for ScenePlanResource {
     }
 }
 
-/// Система: разовый запуск Lua-хука on_level_start.
 pub fn run_on_level_start(
     lua: Option<NonSend<LuaRuntime>>,
     mut done: Local<bool>,
@@ -233,7 +285,6 @@ pub fn run_on_level_start(
     *done = true;
 }
 
-/// Система: тик Lua-таймеров каждый кадр.
 pub fn tick_lua_timers(
     time: Res<Time>,
     lua: Option<NonSend<LuaRuntime>>,
@@ -245,17 +296,12 @@ pub fn tick_lua_timers(
     }
 }
 
-/// Компонент: сущность принадлежит чанку с grid-координатами (gx,gy,gz).
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChunkCell(pub i32, pub i32, pub i32);
 
-/// Ресурс: множество grid-ячеек чанков, уже загруженных в мир.
 #[derive(Resource, Default)]
 pub struct LoadedChunks(pub std::collections::HashSet<(i32, i32, i32)>);
 
-/// Система: рантайм-менеджер чанков (v2).
-/// Подгружает чанки вокруг игрока (default — по X/Z, axis — по одной оси),
-/// выгружает далёкие. Спавнит через expand_chunk_nodes + pick_template_by_chance.
 pub fn chunk_streaming_system(
     time: Res<Time>,
     mut acc: Local<f32>,
@@ -280,7 +326,6 @@ pub fn chunk_streaming_system(
     let Some(px) = player.iter().next().map(|t| t.translation) else { return; };
     let seed = plan.0.seed.unwrap_or(0);
 
-    // Семейства шаблонов по генератору.
     let mut default_t: Vec<&crate::level::build::ChunkTemplatePlan> = Vec::new();
     let mut axis_y: Vec<&crate::level::build::ChunkTemplatePlan> = Vec::new();
     let mut axis_x: Vec<&crate::level::build::ChunkTemplatePlan> = Vec::new();
@@ -301,17 +346,23 @@ pub fn chunk_streaming_system(
     let radius: i32 = 1;
     let cs = chunk_size;
 
-    // Хелпер: заспавнить чанк-шаблон по grid-ячейке.
-    let mut spawn_at = |commands: &mut Commands,
-                        meshes: &mut ResMut<Assets<Mesh>>,
-                        materials: &mut ResMut<Assets<StandardMaterial>>,
-                        loaded: &mut ResMut<LoadedChunks>,
-                        tmpl: &crate::level::build::ChunkTemplatePlan,
-                        grid: (i32, i32, i32)| {
+    fn spawn_at(
+        commands: &mut Commands,
+        meshes: &mut ResMut<Assets<Mesh>>,
+        materials: &mut ResMut<Assets<StandardMaterial>>,
+        loaded: &mut ResMut<LoadedChunks>,
+        tmpl: &crate::level::build::ChunkTemplatePlan,
+        grid: (i32, i32, i32),
+        cs: [f32; 3],
+    ) {
         if loaded.0.contains(&grid) {
             return;
         }
-        let origin = [grid.0 as f32 * cs[0], grid.1 as f32 * cs[1], grid.2 as f32 * cs[2]];
+        let origin = [
+            grid.0 as f32 * cs[0],
+            grid.1 as f32 * cs[1],
+            grid.2 as f32 * cs[2],
+        ];
         let cid = format!("{}/{}", tmpl.id, format!("{}_{}_{}", grid.0, grid.1, grid.2));
         let nodes = crate::level::build::expand_chunk_nodes(&tmpl.nodes, &cid, origin, Some(cs));
         let cell = ChunkCell(grid.0, grid.1, grid.2);
@@ -319,54 +370,73 @@ pub fn chunk_streaming_system(
             spawn_one_node(commands, meshes, materials, n, cell);
         }
         loaded.0.insert(grid);
-    };
+    }
 
-    // Default: сетка X/Z вокруг игрока.
     let pgx = (px.x / cs[0]).floor() as i32;
     let pgz = (px.z / cs[2]).floor() as i32;
     if !default_t.is_empty() {
         for dx in -radius..=radius {
             for dz in -radius..=radius {
                 let grid = (pgx + dx, 0, pgz + dz);
-                if let Some(t) = crate::level::build::pick_template_by_chance(&default_t.iter().map(|x| (*x).clone()).collect::<Vec<_>>(), seed, grid) {
-                    spawn_at(&mut commands, &mut meshes, &mut materials, &mut loaded, t, grid);
+                let picked = crate::level::build::pick_template_by_chance(
+                    &default_t.iter().map(|x| (*x).clone()).collect::<Vec<_>>(),
+                    seed,
+                    grid,
+                )
+                .cloned();
+                if let Some(t) = picked {
+                    spawn_at(&mut commands, &mut meshes, &mut materials, &mut loaded, &t, grid, cs);
                 }
             }
         }
     }
 
-    // Axis("y"): сетка по Y.
     let pgy = (px.y / cs[1]).floor() as i32;
     if !axis_y.is_empty() {
         for dy in -radius..=radius {
             let grid = (0, pgy + dy, 0);
-            if let Some(t) = crate::level::build::pick_template_by_chance(&axis_y.iter().map(|x| (*x).clone()).collect::<Vec<_>>(), seed, grid) {
-                spawn_at(&mut commands, &mut meshes, &mut materials, &mut loaded, t, grid);
+            let picked = crate::level::build::pick_template_by_chance(
+                &axis_y.iter().map(|x| (*x).clone()).collect::<Vec<_>>(),
+                seed,
+                grid,
+            )
+            .cloned();
+            if let Some(t) = picked {
+                spawn_at(&mut commands, &mut meshes, &mut materials, &mut loaded, &t, grid, cs);
             }
         }
     }
 
-    // Axis("x"): сетка по X (y=0, z=0).
     if !axis_x.is_empty() {
         for dx in -radius..=radius {
             let grid = (pgx + dx, 0, 0);
-            if let Some(t) = crate::level::build::pick_template_by_chance(&axis_x.iter().map(|x| (*x).clone()).collect::<Vec<_>>(), seed, grid) {
-                spawn_at(&mut commands, &mut meshes, &mut materials, &mut loaded, t, grid);
+            let picked = crate::level::build::pick_template_by_chance(
+                &axis_x.iter().map(|x| (*x).clone()).collect::<Vec<_>>(),
+                seed,
+                grid,
+            )
+            .cloned();
+            if let Some(t) = picked {
+                spawn_at(&mut commands, &mut meshes, &mut materials, &mut loaded, &t, grid, cs);
             }
         }
     }
 
-    // Axis("z"): сетка по Z (x=0, y=0).
     if !axis_z.is_empty() {
         for dz in -radius..=radius {
             let grid = (0, 0, pgz + dz);
-            if let Some(t) = crate::level::build::pick_template_by_chance(&axis_z.iter().map(|x| (*x).clone()).collect::<Vec<_>>(), seed, grid) {
-                spawn_at(&mut commands, &mut meshes, &mut materials, &mut loaded, t, grid);
+            let picked = crate::level::build::pick_template_by_chance(
+                &axis_z.iter().map(|x| (*x).clone()).collect::<Vec<_>>(),
+                seed,
+                grid,
+            )
+            .cloned();
+            if let Some(t) = picked {
+                spawn_at(&mut commands, &mut meshes, &mut materials, &mut loaded, &t, grid, cs);
             }
         }
     }
 
-    // Выгрузка далёких чанков.
     let far: Vec<((i32, i32, i32), Entity)> = existing
         .iter()
         .filter_map(|(e, c)| {
@@ -385,7 +455,6 @@ pub fn chunk_streaming_system(
     }
 }
 
-/// Спавн одного узла NodePlan с привязкой к чанку.
 pub fn spawn_one_node(
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<Mesh>>,
@@ -439,10 +508,8 @@ pub fn spawn_one_node(
     ));
 }
 
-/// Плагин игры: собирает все ресурсы, регистрирует системы.
 pub struct GamePlugin {
     pub plan: std::sync::Arc<ScenePlan>,
-    /// ScriptEngine внутри Mutex, чтобы GamePlugin был Sync (mlua::Lua не Sync).
     pub engine: std::sync::Mutex<Option<ScriptEngine>>,
     pub level_number: u32,
 }
@@ -466,7 +533,6 @@ impl Plugin for GamePlugin {
     }
 }
 
-/// Парсит hex-цвет #rrggbb или "r g b" (0..1) в Color.
 pub fn parse_hex_color(s: &str) -> Color {
     let t = s.trim();
     if let Some(hex) = t.strip_prefix('#') {
