@@ -12,12 +12,10 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use serde::Deserialize;
 
 pub const API_BASE: &str = "https://api.polyhaven.com";
 pub const USER_AGENT: &str = "backrooms-infinity/0.2 (+https://example.invalid)";
 
-/// Тип ассета в Poly Haven.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolyKind {
     Textures,
@@ -35,14 +33,12 @@ impl PolyKind {
     }
 }
 
-/// Результат поиска одного ассета.
 #[derive(Debug, Clone)]
 pub struct SearchHit {
     pub slug: String,
     pub score: f64,
 }
 
-/// Метаданные ассета из `/info/{id}`.
 #[derive(Debug, Clone, Default)]
 pub struct AssetMeta {
     pub slug: String,
@@ -56,13 +52,11 @@ pub struct AssetMeta {
     pub max_resolution: Option<[u32; 2]>,
 }
 
-/// Один файл внутри ассета.
 #[derive(Debug, Clone)]
 pub struct FileEntry {
     pub url: String,
     pub md5: Option<String>,
     pub size: Option<u64>,
-    /// Для gltf/blend/fbx — include-файлы: { относительный путь -> FileEntry }.
     pub includes: BTreeMap<String, FileEntry>,
 }
 
@@ -84,7 +78,6 @@ impl FileEntry {
 }
 
 /// Файловое дерево ассета (плоский вид).
-/// Ключ: (kind_alias, res, format), например ("diff", "8k", "png").
 #[derive(Debug, Clone, Default)]
 pub struct FilesTree {
     pub entries: BTreeMap<(String, String, String), FileEntry>,
@@ -101,7 +94,6 @@ impl FilesTree {
             "disp" | "displacement" | "height" => "disp",
             "arm" | "ao_rough_metallic" | "orm" => "arm",
             "metal" | "metallic" => "metal",
-            // для моделей
             "gltf" | "glb" => "gltf",
             "fbx" => "fbx",
             "usd" => "usd",
@@ -114,7 +106,6 @@ impl FilesTree {
         self.entries.is_empty()
     }
 
-    /// Найти файл по (kind_alias, res, форматы по предпочтению).
     pub fn find(
         &self,
         kind_alias: &str,
@@ -134,7 +125,6 @@ impl FilesTree {
         None
     }
 
-    /// Все доступные резолюции для kind_alias (отсортированы по возрастанию).
     pub fn resolutions_for(&self, kind_alias: &str) -> Vec<String> {
         let mut s: Vec<String> = self
             .entries
@@ -155,7 +145,6 @@ pub fn parse_resolution(res: &str) -> u32 {
     num.parse::<u32>().map(|n| n * 1024).unwrap_or(0)
 }
 
-/// Клиент Poly Haven API.
 pub struct PolyHavenClient {
     pub timeout: Duration,
     pub max_retries: u32,
@@ -209,7 +198,6 @@ impl PolyHavenClient {
         Err(last_err.unwrap_or_else(|| anyhow!("Poly Haven request failed")))
     }
 
-    /// `GET /search?q=...&t=textures|models`
     pub fn search(
         &self,
         query: &str,
@@ -250,7 +238,6 @@ impl PolyHavenClient {
         Ok(out)
     }
 
-    /// `GET /files/{id}` → плоское дерево.
     pub fn files(&self, slug: &str) -> Result<FilesTree> {
         let path = format!("/files/{}", urlencode(slug));
         let v = self.get_json(&path)?;
@@ -282,14 +269,12 @@ impl PolyHavenClient {
         Ok(tree)
     }
 
-    /// `GET /info/{id}` → метаданные ассета.
     pub fn info(&self, slug: &str) -> Result<AssetMeta> {
         let path = format!("/info/{}", urlencode(slug));
         let v = self.get_json(&path)?;
         Ok(meta_from_json(slug, &v))
     }
 
-    /// Скачать файл по прямой CDN-ссылке.
     pub fn download(&self, url: &str) -> Result<Vec<u8>> {
         let mut last_err: Option<anyhow::Error> = None;
         for attempt in 0..self.max_retries {
@@ -328,10 +313,6 @@ impl PolyHavenClient {
     }
 }
 
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
-
 fn meta_from_json(slug: &str, v: &serde_json::Value) -> AssetMeta {
     let mut m = AssetMeta {
         slug: slug.to_string(),
@@ -368,7 +349,6 @@ fn meta_from_json(slug: &str, v: &serde_json::Value) -> AssetMeta {
     m
 }
 
-/// Минимальный percent-encode (достаточно для наших запросов).
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -450,7 +430,6 @@ mod tests {
                 includes: BTreeMap::new(),
             },
         );
-        // png нет, но jpg — да
         let f = t.find("diff", "8k", &["png", "jpg"]).unwrap();
         assert_eq!(f.url, "u");
     }

@@ -1,35 +1,22 @@
 //! Мост между декларациями ассетов в XML уровня и assets-резолвером.
-//! Проходит по `Resources` и предварительно собирает готовые ассеты
-//! (PNG-текстуры, OBJ-текст) — до построения сцены.
-//!
-//! Логика приоритета (§6.5, §6.7 ТЗ):
-//!   1. src=/path=/url= — читаем файл/URL.
-//!   2. color= — генерируем однотонную PNG.
-//!   3. inline <svg>/<obj> — рендерим/парсим.
-//!   4. tags=... — резолвим через assets.db / ИИ (см. assets::resolver).
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::Result;
 
-use crate::assets::resolver::{is_png, parse_tags, Resolver};
+use crate::assets::resolver::{is_png, Resolver};
 use crate::assets::svg;
 
 use super::model::*;
 
-/// Готовые к использованию ассеты уровня.
 #[derive(Debug, Default)]
 pub struct ResolvedAssets {
-    /// PNG-байты текстур по id.
     pub textures: BTreeMap<String, Vec<u8>>,
-    /// OBJ-текст (или иные байты) моделей по id.
     pub models: BTreeMap<String, Vec<u8>>,
-    /// Источник каждого ассета: "src" | "db" | "ai" | "inline" | "color".
     pub origins: BTreeMap<String, &'static str>,
 }
 
-/// Пройти по ресурсам уровня и подготовить все текстуры/модели.
 pub fn resolve_level_assets(
     level: &Level,
     resolver: &Resolver,
@@ -37,19 +24,25 @@ pub fn resolve_level_assets(
 ) -> Result<ResolvedAssets> {
     let mut out = ResolvedAssets::default();
 
-    // --- текстуры ---
     for tex in &level.resources.textures {
         let bytes_opt: Option<(Vec<u8>, &'static str)> = match &tex.source {
             TextureSource::File(path) => {
-                let p = assets_root.join(path);
-                let p2 = assets_root.join(path.strip_prefix("assets/").unwrap_or(path));
-                let chosen = if p.is_file() { p } else { p2 };
-                std::fs::read(&chosen).ok().map(|b| (b, "src"))
+                match resolver.resolve_texture(Some(path), &[], "", tex.width.max(64)) {
+                    Ok(r) if !r.bytes.is_empty() => {
+                        out.textures.insert(tex.id.clone(), r.bytes);
+                        out.origins.insert(tex.id.clone(), r.source);
+                        continue;
+                    }
+                    _ => {
+                        let p = assets_root.join(path);
+                        let p2 = assets_root
+                            .join(path.strip_prefix("assets/").unwrap_or(path));
+                        let chosen = if p.is_file() { p } else { p2 };
+                        std::fs::read(&chosen).ok().map(|b| (b, "src"))
+                    }
+                }
             }
-            TextureSource::Url(_u) => {
-                // Сетевые URL не тянем в этой версии — fallback в ИИ.
-                None
-            }
+            TextureSource::Url(_u) => None,
             TextureSource::Color(color) => {
                 let svg_str = svg::solid_color_svg(color, tex.width.max(1), tex.height.max(1));
                 svg::svg_to_png(&svg_str, tex.width.max(1), tex.height.max(1))
@@ -70,7 +63,6 @@ pub fn resolve_level_assets(
             }
         }
 
-        // Резолвер — теги/ИИ/БД или fallback-заглушка
         let res = resolver.resolve_texture(
             None,
             &tex.tags,
@@ -81,14 +73,23 @@ pub fn resolve_level_assets(
         out.origins.insert(tex.id.clone(), res.source);
     }
 
-    // --- модели ---
     for m in &level.resources.models {
         let bytes_opt: Option<(Vec<u8>, &'static str)> = match &m.source {
             ModelSource::File(path) => {
-                let p = assets_root.join(path);
-                let p2 = assets_root.join(path.strip_prefix("assets/").unwrap_or(path));
-                let chosen = if p.is_file() { p } else { p2 };
-                std::fs::read(&chosen).ok().map(|b| (b, "src"))
+                match resolver.resolve_model(Some(path), &[], "") {
+                    Ok(r) if !r.bytes.is_empty() => {
+                        out.models.insert(m.id.clone(), r.bytes);
+                        out.origins.insert(m.id.clone(), r.source);
+                        continue;
+                    }
+                    _ => {
+                        let p = assets_root.join(path);
+                        let p2 = assets_root
+                            .join(path.strip_prefix("assets/").unwrap_or(path));
+                        let chosen = if p.is_file() { p } else { p2 };
+                        std::fs::read(&chosen).ok().map(|b| (b, "src"))
+                    }
+                }
             }
             ModelSource::Url(_) => None,
             ModelSource::InlineObj(code) => Some((code.as_bytes().to_vec(), "inline")),
@@ -145,13 +146,12 @@ mod tests {
     #[test]
     fn resolves_color_texture_as_png() {
         let dir = tempdir().unwrap();
-        let assets_root = dir.path().join("assets");
-        std::fs::create_dir_all(&assets_root).unwrap();
-        let db_path = dir.path().join("assets.db");
-        let r = Resolver::open(&db_path, &assets_root).unwrap();
+        let paths = AppPaths::from_root(dir.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        let r = Resolver::open(&paths).unwrap();
 
         let l = mk_level_with_assets();
-        let out = resolve_level_assets(&l, &r, &assets_root).unwrap();
+        let out = resolve_level_assets(&l, &r, &paths.assets_dir).unwrap();
         assert!(out.textures.contains_key("tex_red"));
         assert!(is_png(&out.textures["tex_red"]));
         assert_eq!(out.origins["tex_red"], "color");
@@ -160,28 +160,25 @@ mod tests {
     #[test]
     fn resolves_tags_texture_via_ai_fallback() {
         let dir = tempdir().unwrap();
-        let assets_root = dir.path().join("assets");
-        std::fs::create_dir_all(&assets_root).unwrap();
-        let db_path = dir.path().join("assets.db");
-        let r = Resolver::open(&db_path, &assets_root).unwrap();
+        let paths = AppPaths::from_root(dir.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        let r = Resolver::open(&paths).unwrap();
 
         let l = mk_level_with_assets();
-        let out = resolve_level_assets(&l, &r, &assets_root).unwrap();
+        let out = resolve_level_assets(&l, &r, &paths.assets_dir).unwrap();
         assert!(out.textures.contains_key("tex_wall"));
-        // источник — "ai" (сгенерирована) либо "db" (уже закэширована)
         assert!(matches!(out.origins["tex_wall"], "ai" | "db"));
     }
 
     #[test]
     fn resolves_inline_obj_model() {
         let dir = tempdir().unwrap();
-        let assets_root = dir.path().join("assets");
-        std::fs::create_dir_all(&assets_root).unwrap();
-        let db_path = dir.path().join("assets.db");
-        let r = Resolver::open(&db_path, &assets_root).unwrap();
+        let paths = AppPaths::from_root(dir.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        let r = Resolver::open(&paths).unwrap();
 
         let l = mk_level_with_assets();
-        let out = resolve_level_assets(&l, &r, &assets_root).unwrap();
+        let out = resolve_level_assets(&l, &r, &paths.assets_dir).unwrap();
         let bytes = out.models.get("mdl_cube").unwrap();
         let text = String::from_utf8_lossy(bytes);
         assert!(text.contains("o cube"));

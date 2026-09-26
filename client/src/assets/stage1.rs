@@ -10,43 +10,30 @@
 //!      GET /files/{slug} → выбираем 8K и 6 PBR-карт (diff, nor_gl, rough, ao, disp, arm).
 //!      Скачиваем в cache-files/ с именами {Asset_Slug}_{map}.png.
 //!      Для моделей — gltf + include-файлы рядом.
-//!   4. Если Poly Haven не нашёл — фоллбэк на локальную ИИ-генерацию (assets/gen.rs),
-//!      сохраняем в assets/ (старое место, как раньше).
-//!
-//! Итог: cache-files/ наполнен, локальный ИИ на Этапе 2 сможет ссылаться
-//! на файлы через `<texture src="assets/textures/{Asset_Slug}_diff.png"/>`.
+//!   4. Если Poly Haven не нашёл — фоллбэк на локальную ИИ-генерацию.
 
-use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::paths::AppPaths;
 
-use super::polyhaven::{FilesTree, PolyHavenClient, PolyKind};
-
-// ---------------------------------------------------------------------------
-// AI-клиент для Этапа 1 (локальный OpenAI-совместимый прокси)
-// ---------------------------------------------------------------------------
+use super::polyhaven::{PolyHavenClient, PolyKind};
 
 const AI_ENDPOINT: &str = "http://localhost:9655/v1/chat/completions";
 const AI_MODEL_STAGE1: &str = "deepseek-chat";
 
 /// Одна «потребность» уровня из ответа ИИ.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssetRequest {
-    /// "texture" | "model"
     pub kind: String,
-    /// Текстовый запрос для Poly Haven (английский, короткий).
     pub query: String,
-    /// Опционально — доп. пояснение (для логов).
     #[serde(default)]
     pub used_for: Option<String>,
-    /// Опционально — желаемые теги.
     #[serde(default)]
     pub tags: Vec<String>,
 }
@@ -63,7 +50,6 @@ pub struct Stage1Report {
     pub downloaded_files: Vec<PathBuf>,
 }
 
-/// Системная инструкция для Этапа 1.
 const STAGE1_SYSTEM: &str = "\
 Ты ассистент по подготовке ассетов для игры Backrooms Infinity (Three.js/Bevy, PBR). \
 Тебе дают список файлов, УЖЕ лежащих в локальном кэше (cache-files/), и просят вернуть \
@@ -72,15 +58,13 @@ const STAGE1_SYSTEM: &str = "\
 Каждый элемент: {\"kind\":\"texture\"|\"model\",\"query\":\"...\",\"used_for\":\"...\",\"tags\":[\"...\"]}. \
 Правила: \
 - query пиши на АНГЛИЙСКОМ, коротко (2-4 слова), как для поиска в каталоге PBR-ассетов. \
-- Не запрашивай то, что уже есть в кэше (сравнивай по смыслу, не только по имени). \
-- Для стен/полов/потолков и типовых поверхностей — kind=\"texture\". \
+- Не запрашивай то, что уже есть в кэше. \
+- Для стен/полов/потолков — kind=\"texture\". \
 - Для предметов/мебели/монстров/декораций — kind=\"model\". \
-- Максимум 20 запросов за раз. Если чего-то не хватает критично — упомяни; \
-  редкие backrooms-специфичные монстры Poly Haven НЕ найдёт, но упомянуть их всё равно надо — \
-  движок сгенерирует их локальным ИИ. \
+- Максимум 20 запросов за раз. \
 - Никаких комментариев, никакого текста вне JSON.";
 
-/// Сканирует cache-files/ и возвращает отсортированный список имён файлов.
+/// Сканирует cache-files/ и возвращает отсортированный список имён.
 pub fn scan_cache_files(cache_dir: &Path) -> Result<Vec<String>> {
     if !cache_dir.is_dir() {
         return Ok(Vec::new());
@@ -89,9 +73,11 @@ pub fn scan_cache_files(cache_dir: &Path) -> Result<Vec<String>> {
     for entry in fs::read_dir(cache_dir)? {
         let entry = entry?;
         let ft = entry.file_type()?;
-        if ft.is_file() {
-            if let Some(name) = entry.file_name().to_str() {
+        if let Some(name) = entry.file_name().to_str() {
+            if ft.is_file() {
                 v.push(name.to_string());
+            } else if ft.is_dir() {
+                v.push(format!("{name}/"));
             }
         }
     }
@@ -99,7 +85,6 @@ pub fn scan_cache_files(cache_dir: &Path) -> Result<Vec<String>> {
     Ok(v)
 }
 
-/// Собирает промт-запрос к локальному ИИ. Возвращает «сырой» текст ответа.
 fn ask_ai_for_requests(
     level_number: u32,
     existing_files: &[String],
@@ -158,10 +143,8 @@ fn ask_ai_for_requests(
     parse_stage1_json(content)
 }
 
-/// Парсит JSON-ответ от ИИ, срезая markdown-обёртку.
 fn parse_stage1_json(raw: &str) -> Result<Vec<AssetRequest>> {
     let cleaned = strip_code_fence(raw);
-    // Найти первый '[' и последний ']' — на случай болтовни.
     let start = cleaned
         .find('[')
         .ok_or_else(|| anyhow!("stage1: в ответе нет '['"))?;
@@ -188,15 +171,8 @@ fn strip_code_fence(s: &str) -> String {
     t.to_string()
 }
 
-// ---------------------------------------------------------------------------
-// Скачивание конкретного ассета с Poly Haven
-// ---------------------------------------------------------------------------
-
-/// Канонические PBR-карты, которые мы хотим скачать (все 6).
 const PBR_MAPS: &[&str] = &["diff", "nor_gl", "rough", "ao", "disp", "arm"];
 
-/// Скачивает PBR-набор одной текстуры в cache-files/.
-/// Возвращает список созданных файлов.
 pub fn download_texture(
     client: &PolyHavenClient,
     slug: &str,
@@ -209,8 +185,6 @@ pub fn download_texture(
         return Err(anyhow!("Poly Haven: /files/{slug} пустое дерево"));
     }
 
-    // Проверим, что у нас есть эта резолюция у ключевых карт. Если нет — берём
-    // максимально доступную.
     let available = tree.resolutions_for("diff");
     let res = if available.iter().any(|r| r == resolution) {
         resolution.to_string()
@@ -224,7 +198,7 @@ pub fn download_texture(
     for map in PBR_MAPS {
         let entry = match tree.find(map, &res, &["png", "jpg"]) {
             Some(e) => e,
-            None => continue, // этой карты нет у ассета — пропускаем
+            None => continue,
         };
         let bytes = client.download(&entry.url)?;
         let ext = guess_ext(&entry.url);
@@ -241,8 +215,6 @@ pub fn download_texture(
     Ok(created)
 }
 
-/// Скачивает gltf-модель + include-файлы рядом с .gltf в cache-files/.
-/// Структура include-путей сохраняется в подпапке {slug}_files/.
 pub fn download_model(
     client: &PolyHavenClient,
     slug: &str,
@@ -254,7 +226,6 @@ pub fn download_model(
         return Err(anyhow!("Poly Haven: /files/{slug} пустое дерево (model)"));
     }
 
-    // Ищем gltf — берём максимально доступную резолюцию.
     let resolutions = tree.resolutions_for("gltf");
     let res = resolutions
         .last()
@@ -271,14 +242,12 @@ pub fn download_model(
 
     let mut created = Vec::new();
 
-    // Главный .gltf
     let main_bytes = client.download(&gltf_entry.url)?;
     let main_ext = guess_ext(&gltf_entry.url);
     let main_path = model_dir.join(format!("{safe_name}.{main_ext}"));
     fs::write(&main_path, &main_bytes)?;
     created.push(main_path.clone());
 
-    // include-файлы (текстуры внутри gltf)
     for (rel, entry) in &gltf_entry.includes {
         let target = model_dir.join(rel);
         if let Some(parent) = target.parent() {
@@ -292,8 +261,6 @@ pub fn download_model(
     Ok(created)
 }
 
-/// Пытается найти ассет через Poly Haven /search и скачать.
-/// Возвращает Some(paths) при успехе, None — если Poly Haven не нашёл.
 fn try_polyhaven_for(
     client: &PolyHavenClient,
     req: &AssetRequest,
@@ -307,10 +274,8 @@ fn try_polyhaven_for(
     if hits.is_empty() {
         return Ok(None);
     }
-    // Возьмём топ-1.
     let slug = &hits[0].slug;
 
-    // Метаданные (для нормального имени).
     let meta = client
         .info(slug)
         .unwrap_or_else(|_| super::polyhaven::AssetMeta {
@@ -328,13 +293,6 @@ fn try_polyhaven_for(
     Ok(Some(created))
 }
 
-// ---------------------------------------------------------------------------
-// Публичный вход Этапа 1
-// ---------------------------------------------------------------------------
-
-/// Запускает Этап 1: сканирует кэш, спрашивает ИИ, качает ассеты с Poly Haven,
-/// при неудаче — регистрирует «нужен ИИ-фоллбэк» (сама генерация будет
-/// выполнена позже, на этапе сборки уровня, через assets::gen).
 pub fn run_stage1(
     paths: &AppPaths,
     level_number: u32,
@@ -346,7 +304,6 @@ pub fn run_stage1(
 
     let mut report = Stage1Report::default();
 
-    // 1. Сканируем локальный кэш.
     let existing = scan_cache_files(cache_dir)?;
     report.cached_before = existing.len();
     println!(
@@ -354,13 +311,11 @@ pub fn run_stage1(
         report.cached_before
     );
 
-    // 2. Спрашиваем ИИ.
     let requests = ask_ai_for_requests(level_number, &existing, notes)
         .map_err(|e| anyhow!("stage1: ИИ не ответил: {e}"))?;
     report.requested = requests.len();
     println!("[stage1] ИИ запросил {} ассетов", requests.len());
 
-    // 3. Идём в Poly Haven.
     let client = PolyHavenClient::new();
     let mut ai_fallback_requests: Vec<AssetRequest> = Vec::new();
 
@@ -396,8 +351,6 @@ pub fn run_stage1(
         }
     }
 
-    // 4. ИИ-фоллбэки: пока просто пишем в лог; фактическая генерация —
-    //    при сборке уровня через assets::gen (см. resolver.rs).
     if !ai_fallback_requests.is_empty() {
         let manifest = cache_dir.join("_ai_fallback_requests.json");
         let s = serde_json::to_string_pretty(&ai_fallback_requests)?;
@@ -413,8 +366,6 @@ pub fn run_stage1(
     Ok(report)
 }
 
-/// Нормализация имени ассета для файловой системы:
-/// пробелы → `_`, убираем всё кроме ASCII букв/цифр/`_`/`-`.
 pub fn sanitize_asset_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for ch in name.chars() {
@@ -423,9 +374,7 @@ pub fn sanitize_asset_name(name: &str) -> String {
         } else if ch == ' ' || ch == '-' || ch == '_' {
             out.push('_');
         }
-        // остальное — выбрасываем
     }
-    // Склеим подряд идущие '_'
     let mut collapsed = String::with_capacity(out.len());
     let mut prev_us = false;
     for ch in out.chars() {
@@ -442,9 +391,7 @@ pub fn sanitize_asset_name(name: &str) -> String {
     collapsed.trim_matches('_').to_string()
 }
 
-/// Определяет расширение по URL (по суффиксу, дефолт `png`).
 fn guess_ext(url: &str) -> String {
-    // берём последний сегмент пути до '?'
     let no_q = url.split('?').next().unwrap_or(url);
     let last = no_q.rsplit('/').next().unwrap_or("");
     match last.rsplit_once('.') {
@@ -511,5 +458,18 @@ mod tests {
         std::fs::write(dir.path().join("c.png"), b"x").unwrap();
         let v = scan_cache_files(dir.path()).unwrap();
         assert_eq!(v, vec!["a.png", "b.png", "c.png"]);
+    }
+
+    #[test]
+    fn asset_request_serializes() {
+        let r = AssetRequest {
+            kind: "texture".into(),
+            query: "concrete".into(),
+            used_for: Some("walls".into()),
+            tags: vec!["concrete".into()],
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains("concrete"));
+        assert!(s.contains("walls"));
     }
 }
