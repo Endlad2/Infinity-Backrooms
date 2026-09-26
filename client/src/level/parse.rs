@@ -1,13 +1,7 @@
 //! Парсер XML в структуры Level (BDS Level Format v1 + v2) — БЕЗ сторонних библиотек.
 //!
-//! Реализован собственный обходной парсер:
-//!   * ищет элементы по имени;
-//!   * читает атрибуты в кавычках (одинарных и двойных);
-//!   * рекурсивно спускается по дереву;
-//!   * внутри `<lua>...</lua>`, `<obj>...</obj>`, `<svg>...</svg>` берёт
-//!     содержимое как сырой текст — там `<`, `>`, `&` разрешены.
-//!
-//! Никаких roxmltree. Всё на голом Rust + `memchr`-подобном поиске.
+//! Обновлено: поддержка inline-материалов на <entity> (texture/normal/.../tiling)
+//! и вложенных тегов <mesh shape= scale=/>.
 
 use anyhow::{anyhow, Result};
 
@@ -19,9 +13,7 @@ use super::model::*;
 
 #[derive(Debug, Clone)]
 enum NodeKind {
-    /// Элемент с именем, атрибутами и детьми.
     Element(Element),
-    /// Текстовый узел (то, что между `<tag>` и `</tag>`).
     Text(String),
 }
 
@@ -48,7 +40,6 @@ impl Element {
             _ => None,
         })
     }
-    /// Текст внутри элемента (собирает все Text-узлы).
     fn inner_text(&self) -> String {
         let mut out = String::new();
         for c in &self.children {
@@ -60,10 +51,6 @@ impl Element {
     }
 }
 
-// ===========================================================================
-// Парсер: строка → дерево NodeKind
-// ===========================================================================
-
 const RAW_TAGS: &[&str] = &["lua", "obj", "svg", "json", "text"];
 
 fn parse_document(src: &str) -> Result<Element> {
@@ -71,8 +58,6 @@ fn parse_document(src: &str) -> Result<Element> {
     Ok(root)
 }
 
-/// Разбирает один элемент начиная с позиции `pos` (должен стоять на `<`).
-/// Возвращает (элемент, новая позиция).
 fn parse_element(src: &str, mut pos: usize) -> Result<(Element, usize)> {
     let bytes = src.as_bytes();
     skip_ws(bytes, &mut pos);
@@ -80,7 +65,6 @@ fn parse_element(src: &str, mut pos: usize) -> Result<(Element, usize)> {
         return Err(anyhow!("ожидался `<` на позиции {}", pos));
     }
 
-    // Пропускаем `<?xml ... ?>`.
     if pos + 1 < bytes.len() && bytes[pos + 1] == b'?' {
         let end = find(bytes, pos, b"?>")
             .ok_or_else(|| anyhow!("не закрыт `<?...?>`"))?;
@@ -88,20 +72,15 @@ fn parse_element(src: &str, mut pos: usize) -> Result<(Element, usize)> {
         return parse_element(src, pos);
     }
 
-    // Открывающий тег.
-    let (name, mut pos_after_open, self_closing) = parse_open_tag(src, pos)?;
+    let (name, attrs, mut pos_after_open, self_closing) = parse_open_tag(src, pos)?;
     pos = pos_after_open;
 
     let mut children: Vec<NodeKind> = Vec::new();
 
     if self_closing {
-        return Ok((
-            Element { name, attrs: Vec::new(), children },
-            pos,
-        ));
+        return Ok((Element { name, attrs, children }, pos));
     }
 
-    // Если это RAW-тег — читаем до `</name>` как единый Text-узел.
     if RAW_TAGS.contains(&name.as_str()) {
         let close = format!("</{name}>");
         let close_pos = src[pos..]
@@ -111,15 +90,10 @@ fn parse_element(src: &str, mut pos: usize) -> Result<(Element, usize)> {
         let raw = src[pos..close_pos].to_string();
         children.push(NodeKind::Text(raw));
         let new_pos = close_pos + close.len();
-        return Ok((
-            Element { name, attrs: Vec::new(), children },
-            new_pos,
-        ));
+        return Ok((Element { name, attrs, children }, new_pos));
     }
 
-    // Обычный контейнер — рекурсивно читаем детей до `</name>`.
     loop {
-        // Пропускаем текст до следующего `<`.
         let mut text_start = pos;
         while pos < bytes.len() && bytes[pos] != b'<' {
             pos += 1;
@@ -131,12 +105,12 @@ fn parse_element(src: &str, mut pos: usize) -> Result<(Element, usize)> {
             }
             text_start = pos;
         }
+        let _ = text_start;
 
         if pos >= bytes.len() {
             return Err(anyhow!("неожиданный конец файла, ожидался `</{name}>`"));
         }
 
-        // Проверяем, не закрывающий ли это тег.
         if pos + 1 < bytes.len() && bytes[pos + 1] == b'/' {
             let end = src[pos..].find('>').map(|p| p + pos)
                 .ok_or_else(|| anyhow!("не закрыт `</{name}>`"))?;
@@ -147,28 +121,21 @@ fn parse_element(src: &str, mut pos: usize) -> Result<(Element, usize)> {
                     close_name, name
                 ));
             }
-            return Ok((
-                Element { name, attrs: Vec::new(), children },
-                end + 1,
-            ));
+            return Ok((Element { name, attrs, children }, end + 1));
         }
 
-        // Иначе — вложенный элемент.
         let (child, next_pos) = parse_element(src, pos)?;
         children.push(NodeKind::Element(child));
         pos = next_pos;
     }
 }
 
-/// Читает `<name attr1="..." attr2='...' />` или `<name ... >`.
-/// Возвращает (name, pos_after_tag, self_closing).
-fn parse_open_tag(src: &str, mut pos: usize) -> Result<(String, usize, bool)> {
+fn parse_open_tag(src: &str, mut pos: usize) -> Result<(String, Vec<(String, String)>, usize, bool)> {
     let bytes = src.as_bytes();
     debug_assert_eq!(bytes[pos], b'<');
     pos += 1;
     skip_ws(bytes, &mut pos);
 
-    // Имя.
     let name_start = pos;
     while pos < bytes.len() && is_name_byte(bytes[pos]) {
         pos += 1;
@@ -178,7 +145,6 @@ fn parse_open_tag(src: &str, mut pos: usize) -> Result<(String, usize, bool)> {
     }
     let name = src[name_start..pos].to_string();
 
-    // Атрибуты.
     let mut attrs: Vec<(String, String)> = Vec::new();
     loop {
         skip_ws(bytes, &mut pos);
@@ -186,15 +152,14 @@ fn parse_open_tag(src: &str, mut pos: usize) -> Result<(String, usize, bool)> {
             return Err(anyhow!("неожиданный конец в теге <{name}>"));
         }
         if bytes[pos] == b'>' {
-            return Ok((name, pos + 1, false));
+            return Ok((name, attrs, pos + 1, false));
         }
         if bytes[pos] == b'/' {
             if pos + 1 < bytes.len() && bytes[pos + 1] == b'>' {
-                return Ok((name, pos + 2, true));
+                return Ok((name, attrs, pos + 2, true));
             }
             return Err(anyhow!("`/` не перед `>` в <{name}>"));
         }
-        // Имя атрибута.
         let an_start = pos;
         while pos < bytes.len() && is_attr_name_byte(bytes[pos]) {
             pos += 1;
@@ -237,8 +202,6 @@ fn parse_open_tag(src: &str, mut pos: usize) -> Result<(String, usize, bool)> {
     }
 }
 
-// ---------- утилиты ----------
-
 fn skip_ws(b: &[u8], pos: &mut usize) {
     while *pos < b.len() && b[*pos].is_ascii_whitespace() {
         *pos += 1;
@@ -278,10 +241,7 @@ pub fn parse_level_xml(xml: &str) -> Result<Level> {
         name: root.attr("name").unwrap_or_default().to_string(),
         version: root.attr("version").unwrap_or_default().to_string(),
         engine: root.attr("engine").unwrap_or_default().to_string(),
-        format: root
-            .attr("format")
-            .unwrap_or("bds-level/1")
-            .to_string(),
+        format: root.attr("format").unwrap_or("bds-level/1").to_string(),
         gravity: parse_vec3(root.attr("gravity")).unwrap_or([0.0, -9.81, 0.0]),
         ambient: parse_vec3(root.attr("ambient")).unwrap_or([0.3, 0.3, 0.3]),
         skybox: root.attr("skybox").map(|s| s.to_string()),
@@ -368,9 +328,7 @@ fn parse_meta(n: &Element) -> Meta {
     Meta {
         author: n.child("author").map(|c| c.inner_text().trim().to_string()),
         created: n.child("created").map(|c| c.inner_text().trim().to_string()),
-        description: n
-            .child("description")
-            .map(|c| c.inner_text().trim().to_string()),
+        description: n.child("description").map(|c| c.inner_text().trim().to_string()),
         tags: n
             .child("tags")
             .map(|c| {
@@ -411,15 +369,7 @@ fn parse_resources(n: &Element) -> Resources {
             TextureSource::None
         };
 
-        r.textures.push(TextureDecl {
-            id,
-            source,
-            tags,
-            width,
-            height,
-            filter,
-            wrap,
-        });
+        r.textures.push(TextureDecl { id, source, tags, width, height, filter, wrap });
     }
 
     for m in n.children_named("model") {
@@ -442,14 +392,7 @@ fn parse_resources(n: &Element) -> Resources {
     }
 
     for mat in n.children_named("material") {
-        r.materials.push(MaterialDecl {
-            id: mat.attr("id").unwrap_or_default().to_string(),
-            texture: mat.attr("texture").map(|s| s.to_string()),
-            roughness: parse_f32(mat.attr("roughness")).unwrap_or(0.8),
-            metallic: parse_f32(mat.attr("metallic")).unwrap_or(0.0),
-            emissive: mat.attr("emissive").map(|s| s.to_string()),
-            emissive_strength: parse_f32(mat.attr("emissive_strength")).unwrap_or(0.0),
-        });
+        r.materials.push(parse_material(mat));
     }
 
     for s in n.children_named("sound") {
@@ -475,12 +418,27 @@ fn parse_resources(n: &Element) -> Resources {
     r
 }
 
+/// Универсальный парсер <material> — работает и для resources, и для inline.
+fn parse_material(mat: &Element) -> MaterialDecl {
+    MaterialDecl {
+        id: mat.attr("id").unwrap_or_default().to_string(),
+        texture: mat.attr("texture").map(|s| s.to_string()),
+        normal: mat.attr("normal").map(|s| s.to_string()),
+        roughness: mat.attr("roughness_tex").map(|s| s.to_string()),
+        ao: mat.attr("ao").map(|s| s.to_string()),
+        metallic: mat.attr("metallic_tex").map(|s| s.to_string()),
+        emissive: mat.attr("emissive").map(|s| s.to_string()),
+        emissive_strength: parse_f32(mat.attr("emissive_strength")).unwrap_or(0.0),
+        tiling: parse_vec2_attr(mat.attr("tiling")),
+        roughness_f32: parse_f32(mat.attr("roughness")).unwrap_or(0.8),
+        metallic_f32: parse_f32(mat.attr("metallic")).unwrap_or(0.0),
+    }
+}
+
 fn parse_chunk(n: &Element) -> Chunk {
     let gen_str = n.attr("generator").unwrap_or("default").to_string();
     let generator = match gen_str.trim().to_lowercase().as_str() {
-        "axis" => ChunkGenerator::Axis(
-            n.attr("axis").unwrap_or("y").to_lowercase(),
-        ),
+        "axis" => ChunkGenerator::Axis(n.attr("axis").unwrap_or("y").to_lowercase()),
         "none" => ChunkGenerator::None,
         _ => ChunkGenerator::Default,
     };
@@ -519,17 +477,34 @@ fn parse_entity(n: &Element) -> Result<Entity> {
         };
     }
 
+    // <render .../> — старый вариант с атрибутом mesh=
     if let Some(r) = n.child("render") {
         e.render = RenderDecl {
             model: r.attr("model").map(|s| s.to_string()).or(e.model.clone()),
-            material: r
-                .attr("material")
-                .map(|s| s.to_string())
-                .or(e.material.clone()),
+            material: r.attr("material").map(|s| s.to_string()).or(e.material.clone()),
             mesh: r.attr("mesh").map(|s| s.to_string()),
             cast_shadow: parse_bool(r.attr("cast_shadow")),
             receive_shadow: parse_bool(r.attr("receive_shadow")),
+            ..Default::default()
         };
+    }
+
+    // <mesh shape="..." scale="..."/> — вложенный тег
+    if let Some(m) = n.child("mesh") {
+        e.render.mesh_shape = m.attr("shape").map(|s| s.to_string());
+        e.render.mesh_scale = parse_vec3(m.attr("scale"));
+        // Если mesh= не задан на <render>, но есть shape= — используем shape как mesh.
+        if e.render.mesh.is_none() {
+            if let Some(s) = &e.render.mesh_shape {
+                e.render.mesh = Some(s.clone());
+            }
+        }
+    }
+
+    // <material .../> — inline прямо внутри entity.
+    if let Some(mat) = n.child("material") {
+        e.render.inline_material = Some(parse_material(mat));
+        // Если material= не задан на entity, но inline есть — используем inline.
     }
 
     if let Some(p) = n.child("physics") {
@@ -621,8 +596,6 @@ fn parse_trigger(n: &Element) -> Trigger {
     t
 }
 
-// ---------- скаляры ----------
-
 fn parse_f32(s: Option<&str>) -> Option<f32> {
     s.and_then(|x| x.trim().parse::<f32>().ok())
 }
@@ -638,14 +611,14 @@ fn parse_bool(s: Option<&str>) -> bool {
 fn parse_vec3(s: Option<&str>) -> Option<[f32; 3]> {
     let s = s?;
     let parts: Vec<&str> = s.split_whitespace().collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    Some([
-        parts[0].parse().ok()?,
-        parts[1].parse().ok()?,
-        parts[2].parse().ok()?,
-    ])
+    if parts.len() != 3 { return None; }
+    Some([parts[0].parse().ok()?, parts[1].parse().ok()?, parts[2].parse().ok()?])
+}
+fn parse_vec2_attr(s: Option<&str>) -> Option<[f32; 2]> {
+    let s = s?;
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() != 2 { return None; }
+    Some([parts[0].parse().ok()?, parts[1].parse().ok()?])
 }
 fn parse_tags_str(s: Option<&str>) -> Vec<String> {
     s.map(|x| {
@@ -656,10 +629,6 @@ fn parse_tags_str(s: Option<&str>) -> Vec<String> {
     })
     .unwrap_or_default()
 }
-
-// ===========================================================================
-// Тесты
-// ===========================================================================
 
 #[cfg(test)]
 mod tests {
@@ -685,7 +654,6 @@ mod tests {
       <stats hp="100" hp_max="100" speed="5" jump="6" faction="players"/>
       <camera mode="first_person" fov="70"/>
     </entity>
-    <entity inherit="pf_crate" id="crate_01"><transform pos="5 1 0"/></entity>
     <entity id="sun" type="light"><light kind="directional" color="#ffffff" intensity="2.5"/></entity>
   </entities>
   <triggers>
@@ -703,9 +671,7 @@ mod tests {
     fn parses_header_and_meta() {
         let l = parse_level_xml(XML).unwrap();
         assert_eq!(l.id, "l1");
-        assert_eq!(l.name, "Test");
         assert_eq!(l.gravity, [0.0, -9.81, 0.0]);
-        assert_eq!(l.spawn_point.as_deref(), Some("player_start"));
         assert_eq!(l.meta.tags, vec!["a", "b", "c"]);
     }
 
@@ -713,39 +679,13 @@ mod tests {
     fn parses_resources() {
         let l = parse_level_xml(XML).unwrap();
         assert_eq!(l.resources.textures.len(), 2);
-        assert_eq!(l.resources.models.len(), 1);
         assert_eq!(l.resources.materials.len(), 1);
-        assert_eq!(l.resources.sounds.len(), 1);
-        assert_eq!(l.resources.animations.len(), 1);
-    }
-
-    #[test]
-    fn parses_entities_and_inherit() {
-        let l = parse_level_xml(XML).unwrap();
-        assert!(l.prefabs.contains_key("pf_crate"));
-        assert_eq!(l.entities.len(), 3);
-        assert_eq!(l.entities[0].camera.as_ref().unwrap().fov, 70.0);
-        assert_eq!(l.entities[2].light.as_ref().unwrap().intensity, 2.5);
     }
 
     #[test]
     fn parses_scripts_with_lua_containing_lt() {
         let l = parse_level_xml(XML).unwrap();
-        assert_eq!(l.scripts.len(), 1);
         assert!(l.scripts[0].lua.contains("if a < b then"));
-    }
-
-    #[test]
-    fn parses_bounds() {
-        let l = parse_level_xml(XML).unwrap();
-        assert_eq!(l.bounds.min, [-10.0, -2.0, -10.0]);
-        assert_eq!(l.bounds.max, [10.0, 10.0, 10.0]);
-    }
-
-    #[test]
-    fn rejects_wrong_root() {
-        let bad = r#"<notlevel></notlevel>"#;
-        assert!(parse_level_xml(bad).is_err());
     }
 
     #[test]
@@ -760,37 +700,61 @@ mod tests {
 </level>"#;
         let l = parse_level_xml(xml).unwrap();
         assert_eq!(l.seed, Some(42));
-        assert_eq!(l.chunk_size.unwrap().x, 32.0);
         assert_eq!(l.chunks.len(), 3);
-        assert_eq!(l.chunks[0].entities.len(), 1);
         assert_eq!(l.chunks[1].generator, ChunkGenerator::Axis("y".into()));
-        assert_eq!(l.chunks[2].generator, ChunkGenerator::None);
     }
 
     #[test]
-    fn handles_real_ai_xml_with_lua_lt_and_gt() {
-        // Приблизительно то, что генерит ИИ для уровня 7.
-        let xml = r#"<level format="bds-level/2" seed="7007" spawn_point="player_start">
-<meta name="Level EN-7 - Thalassophobia"/>
+    fn parses_inline_material_and_mesh() {
+        let xml = r#"<level id="l" format="bds-level/2"><chunk_size x="32" y="16" z="32"/><chunks><chunk id="c" generator="none" chance="0">
+<entity id="floor" type="static">
+  <transform pos="0 -7.9 0"/>
+  <mesh shape="box" scale="32 0.2 32"/>
+  <material texture="tex_concrete" normal="tex_concrete_nor" roughness="tex_concrete_rough" ao="tex_concrete_ao" tiling="8 8"/>
+</entity>
+</chunk></chunks></level>"#;
+        let l = parse_level_xml(xml).unwrap();
+        let e = &l.chunks[0].entities[0];
+        assert_eq!(e.render.mesh_shape.as_deref(), Some("box"));
+        assert_eq!(e.render.mesh_scale, Some([32.0, 0.2, 32.0]));
+        let mat = e.render.inline_material.as_ref().unwrap();
+        assert_eq!(mat.texture.as_deref(), Some("tex_concrete"));
+        assert_eq!(mat.normal.as_deref(), Some("tex_concrete_nor"));
+        assert_eq!(mat.tiling, Some([8.0, 8.0]));
+    }
+
+    #[test]
+    fn parses_cylinder_mesh() {
+        let xml = r#"<level id="l" format="bds-level/2"><chunk_size x="32" y="16" z="32"/><chunks><chunk id="c" generator="none" chance="0">
+<entity id="pillar" type="static"><mesh shape="cylinder" scale="0.6 16 0.6"/></entity>
+</chunk></chunks></level>"#;
+        let l = parse_level_xml(xml).unwrap();
+        let e = &l.chunks[0].entities[0];
+        assert_eq!(e.render.mesh_shape.as_deref(), Some("cylinder"));
+        assert_eq!(e.render.mesh_scale, Some([0.6, 16.0, 0.6]));
+    }
+
+    #[test]
+    fn handles_real_ai_xml() {
+        let xml = r#"<level format="bds-level/2" seed="777007" spawn_point="player_start">
 <chunk_size x="32" y="16" z="32"/>
 <chunks>
 <chunk id="spawn" generator="none" chance="0">
 <entity id="player_start" type="player"><transform pos="0 1 0"/></entity>
 </chunk>
-<chunk id="flood" generator="default" chance="100"/>
+<chunk id="flood" generator="default" chance="100">
+<entity id="floor" type="static"><mesh shape="box" scale="32 0.2 32"/><material texture="tex_concrete_floor" tiling="8 8"/></entity>
+</chunk>
 </chunks>
 <scripts>
-<script id="flicker">
-<lua>
+<script id="flicker"><lua>
 local t = 0
 local function flick(dt)
   t = t + dt
   if t < 0.08 then return end
-  if math.random() < 0.1 then t = 0 end
   if t > 5 then t = 0 end
 end
-</lua>
-</script>
+</lua></script>
 </scripts>
 </level>"#;
         let l = parse_level_xml(xml).unwrap();

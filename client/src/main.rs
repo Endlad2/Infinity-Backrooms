@@ -1,6 +1,4 @@
 //! Точка входа Backrooms Infinity game client.
-//! Парсит CLI, готовит каталоги данных, при необходимости запускает
-//! двухэтапную генерацию уровня (Poly Haven → ИИ → XML), затем запускает Bevy.
 
 mod ai;
 mod assets;
@@ -21,7 +19,7 @@ use std::sync::Arc;
 
 use crate::assets::resolver::Resolver;
 use crate::cli::{Cli, Mode};
-use crate::game::{GamePlugin, ScenePlanResource};
+use crate::game::GamePlugin;
 use crate::level::assets_bridge::resolve_level_assets;
 use crate::level::build::build_scene_plan;
 use crate::level::parse::parse_level_xml;
@@ -29,7 +27,6 @@ use crate::paths::AppPaths;
 use crate::scripting::ScriptEngine;
 use crate::settings::Settings;
 
-/// Разрешение по умолчанию для скачиваемых текстур (Этап 1).
 const DEFAULT_TEXTURE_RES: &str = "8k";
 
 fn main() -> Result<()> {
@@ -49,11 +46,52 @@ fn main() -> Result<()> {
     }
 }
 
+/// Копирует cache-files/X_files/ → assets/models/X_files/, если ещё не скопировано.
+/// Нужно, чтобы AssetServer (который смотрит только в assets/ рядом с exe) мог
+/// найти gltf.
+fn sync_gltf_to_assets(paths: &AppPaths) -> Result<()> {
+    let cache = &paths.cache_files_dir;
+    let target_models = &paths.models_dir;
+    if !cache.is_dir() { return Ok(()); }
+
+    for entry in std::fs::read_dir(cache)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() { continue; }
+        let name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if !name.ends_with("_files") { continue; }
+
+        let target_dir = target_models.join(name);
+        if target_dir.is_dir() { continue; } // уже скопировано
+        std::fs::create_dir_all(&target_dir)?;
+        copy_dir_recursive(&path, &target_dir)?;
+        println!("[assets] gltf скопирован: {} → {}", path.display(), target_dir.display());
+    }
+    Ok(())
+}
+
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let p = entry.path();
+        let target = dst.join(entry.file_name());
+        if p.is_dir() {
+            copy_dir_recursive(&p, &target)?;
+        } else {
+            std::fs::copy(&p, &target)?;
+        }
+    }
+    Ok(())
+}
+
 fn run_single(cli: &Cli, paths: &AppPaths, settings: &Settings) -> Result<()> {
     let level_number = cli.level.unwrap_or(0);
     let level_xml_path = paths.level_xml(level_number);
 
-    // Двухэтапная генерация: только если XML ещё нет (или есть --notes).
     if !level_xml_path.is_file() || cli.notes.is_some() {
         println!("Генерация уровня {level_number}...");
         if let Err(e) = level::gen::generate_level_full(
@@ -68,18 +106,20 @@ fn run_single(cli: &Cli, paths: &AppPaths, settings: &Settings) -> Result<()> {
         }
     }
 
-    // Загружаем XML.
+    // Копируем gltf из cache-files в assets/models/ — AssetServer туда смотрит.
+    if let Err(e) = sync_gltf_to_assets(paths) {
+        eprintln!("[assets] не удалось синхронизировать gltf: {e}");
+    }
+
     let xml = std::fs::read_to_string(&level_xml_path)?;
     let level = parse_level_xml(&xml)?;
 
-    // Готовим ассеты (cache-files + БД + ИИ).
     let resolver = Resolver::open(paths)?;
     let assets = resolve_level_assets(&level, &resolver, &paths.assets_dir)?;
 
-    // Строим план сцены.
     let plan = Arc::new(build_scene_plan(&level, &assets)?);
+    let assets_arc = Arc::new(assets);
 
-    // Lua-скрипты.
     let mut engine = ScriptEngine::new()?;
     let scripts: Vec<(String, String)> = level
         .scripts
@@ -91,7 +131,7 @@ fn run_single(cli: &Cli, paths: &AppPaths, settings: &Settings) -> Result<()> {
         .map_err(|e| anyhow!("Lua: {e}"))?;
 
     println!("Запуск одиночной игры: уровень {level_number}");
-    run_bevy(plan, Some(engine), level_number, settings);
+    run_bevy(plan, assets_arc, Some(engine), level_number, settings, paths);
     Ok(())
 }
 
@@ -99,7 +139,6 @@ fn run_host(cli: &Cli, paths: &AppPaths, settings: &Settings) -> Result<()> {
     let level_number = cli.level.unwrap_or(0);
     println!("Мультиплеер — ХОСТ на уровне {level_number}");
     let _ = crate::net::host::start_lobby(27015)?;
-    println!("LAN IP показывается в окне игры (см. UI)");
     run_single(cli, paths, settings)
 }
 
@@ -112,33 +151,39 @@ fn run_join(cli: &Cli, _paths: &AppPaths) -> Result<()> {
 
 fn run_bevy(
     plan: Arc<level::build::ScenePlan>,
+    assets: Arc<level::assets_bridge::ResolvedAssets>,
     engine: Option<ScriptEngine>,
     level_number: u32,
     settings: &Settings,
+    paths: &AppPaths,
 ) {
     use bevy::prelude::*;
 
     let mut app = App::new();
-    app.add_plugins(
-        DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: format!("Backrooms Infinity — Level {level_number}"),
-                ..default()
-            }),
+    app.add_plugins(DefaultPlugins.set(WindowPlugin {
+        primary_window: Some(Window {
+            title: format!("Backrooms Infinity — Level {level_number}"),
             ..default()
         }),
-    );
+        ..default()
+    }));
+
+    // Добавляем asset source для cache-files/ (чтобы AssetServer мог искать gltf).
+    // В Bevy 0.14 это делается через AssetPlugin::file_path, но проще —
+    // синхронизировать файлы в assets/. Мы уже сделали sync_gltf_to_assets.
+
     app.insert_resource(player::MouseSensitivity(settings.mouse_sensitivity));
     app.add_plugins(player::controller::PlayerPlugin);
     app.add_plugins(player::camera::CameraPlugin);
     app.add_plugins(ui::PausePlugin::default());
     app.add_plugins(GamePlugin {
         plan,
+        assets,
         engine: std::sync::Mutex::new(engine),
         level_number,
     });
+
+    let _ = paths; // пока не используется в run_bevy
+
     app.run();
 }
-
-#[allow(dead_code)]
-fn _type_hint(_: ScenePlanResource) {}

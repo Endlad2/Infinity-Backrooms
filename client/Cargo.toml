@@ -1,6 +1,6 @@
 [package]
 name = "backrooms-client"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Backrooms Infinity game client (Rust + Bevy)"
 
@@ -16,7 +16,6 @@ thiserror = "1"
 dirs = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# roxmltree удалён — парсим своим валидатором в ai/parse.rs
 rusqlite = { version = "0.31", features = ["bundled"] }
 ureq = { version = "2", features = ["json"] }
 resvg = "0.42"
@@ -25,6 +24,12 @@ usvg = "0.42"
 mlua = { version = "0.9", features = ["lua54", "vendored", "send"] }
 rand = "0.8"
 byteorder = "1"
+image = "0.25"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Оптимизация зависимостей в dev-профиле, чтобы даже debug-сборка
+# Bevy была играбельной.
+[profile.dev.package."*"]
+opt-level = 3

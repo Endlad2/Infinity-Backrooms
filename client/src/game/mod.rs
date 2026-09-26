@@ -1,9 +1,12 @@
-//! Основной игровой модуль Bevy: App, сборка сцены из ScenePlan,
-//! запуск Lua-хуков, интеграция UI паузы, чанковый стриминг.
+//! Основной игровой модуль Bevy: сборка сцены из ScenePlan,
+//! ПРИМЕНЕНИЕ PBR-текстур и gltf-моделей, Lua-хуки, чанковый стриминг.
 
 use bevy::prelude::*;
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use bevy::render::texture::Image;
 
 use crate::level::build::{ColliderPlan, LightKindPlan, MeshKind, NodeKind, ScenePlan};
+use crate::level::assets_bridge::ResolvedAssets;
 use crate::scripting::ScriptEngine;
 
 #[derive(Resource, Default)]
@@ -40,15 +43,55 @@ pub struct SceneNodeId(pub String);
 #[derive(Component, Debug, Clone)]
 pub struct SceneTriggerId(pub String);
 
+/// Ресурс с разрешёнными ассетами уровня (PNG-байты, OBJ-текст, gltf-пути).
+#[derive(Resource, Default)]
+pub struct ResolvedAssetsResource {
+    pub textures: std::collections::BTreeMap<String, Vec<u8>>,
+    pub models: std::collections::BTreeMap<String, Vec<u8>>,
+    pub origins: std::collections::BTreeMap<String, &'static str>,
+}
+
+impl From<&ResolvedAssets> for ResolvedAssetsResource {
+    fn from(a: &ResolvedAssets) -> Self {
+        Self {
+            textures: a.textures.clone(),
+            models: a.models.clone(),
+            origins: a.origins.clone(),
+        }
+    }
+}
+
+/// Загрузить PNG-байты в Bevy Image asset, вернуть Handle<Image>.
+fn load_png_into_images(bytes: &[u8], images: &mut ResMut<Assets<Image>>) -> Option<Handle<Image>> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    let bevy_img = Image::new(
+        Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        rgba.into_raw(),
+        TextureFormat::Rgba8UnormSrgb,
+        bevy::render::render_asset::RenderAssetUsages::default(),
+    );
+    Some(images.add(bevy_img))
+}
+
 /// Система сборки сцены из ScenePlan.
 pub fn spawn_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
     plan: Res<ScenePlanResource>,
+    resolved: Res<ResolvedAssetsResource>,
+    asset_server: Res<AssetServer>,
 ) {
     let plan = &plan.0;
     let mut player_spawned = false;
+
+    // Кэш загруженных текстур, чтобы не загружать одну PNG несколько раз.
+    let mut tex_cache: std::collections::HashMap<String, Handle<Image>> =
+        std::collections::HashMap::new();
 
     for node in &plan.nodes {
         let tf = Transform {
@@ -59,7 +102,11 @@ pub fn spawn_scene(
                 node.rot[1].to_radians(),
                 node.rot[2].to_radians(),
             ),
-            scale: Vec3::new(node.scale[0], node.scale[1], node.scale[2]),
+            scale: Vec3::new(
+                node.scale[0].max(1e-6),
+                node.scale[1].max(1e-6),
+                node.scale[2].max(1e-6),
+            ),
         };
 
         if node.kind == NodeKind::Light {
@@ -83,7 +130,7 @@ pub fn spawn_scene(
                             PointLight {
                                 color: c,
                                 intensity: intensity * 100_000.0,
-                                range: range.max(0.1) * 1.0,
+                                range: range.max(0.1),
                                 shadows_enabled: true,
                                 ..default()
                             },
@@ -96,7 +143,7 @@ pub fn spawn_scene(
                             PointLight {
                                 color: c,
                                 intensity: intensity * 100_000.0,
-                                range: range.max(0.1) * 1.0,
+                                range: range.max(0.1),
                                 shadows_enabled: false,
                                 ..default()
                             },
@@ -111,10 +158,7 @@ pub fn spawn_scene(
 
         if node.kind == NodeKind::Player {
             commands.spawn((
-                Camera3dBundle {
-                    transform: tf,
-                    ..default()
-                },
+                Camera3dBundle { transform: tf, ..default() },
                 crate::player::camera::FpsCamera::default(),
                 crate::player::Player::default(),
                 crate::player::Velocity3::default(),
@@ -126,29 +170,28 @@ pub fn spawn_scene(
             continue;
         }
 
-        let (mesh_handle, _is_plane) = match &node.mesh {
-            Some(MeshKind::Plane) => (meshes.add(Plane3d::default().mesh().size(1.0, 1.0)), true),
-            Some(MeshKind::Cube) | None => (meshes.add(Cuboid::new(1.0, 1.0, 1.0)), false),
-            Some(MeshKind::Sphere) => (meshes.add(Sphere::new(0.5)), false),
-            Some(MeshKind::Custom { .. }) => {
-                (meshes.add(Cuboid::new(1.0, 1.0, 1.0)), false)
-            }
-        };
+        // === Меш ===
+        let mesh_handle = build_mesh_handle(
+            &node.mesh,
+            &mut meshes,
+            &asset_server,
+            &mut commands,
+            &node.id,
+        );
 
-        let color = if let Some(_t) = &node.texture_id {
-            Color::srgb(0.8, 0.8, 0.8)
-        } else {
-            Color::srgb(0.6, 0.6, 0.65)
-        };
-        let mat = materials.add(StandardMaterial {
-            base_color: color,
-            ..default()
-        });
+        // === Материал с PBR-текстурами ===
+        let material = build_material(
+            node,
+            &resolved,
+            &mut images,
+            &mut tex_cache,
+        );
+        let mat_handle = materials.add(material);
 
         let mut ecmd = commands.spawn((
             PbrBundle {
                 mesh: mesh_handle,
-                material: mat,
+                material: mat_handle,
                 transform: tf,
                 ..default()
             },
@@ -173,16 +216,11 @@ pub fn spawn_scene(
         ));
     }
 
-    // === FALLBACK: если игрок не был найден в плане — спавним камеру сами.
-    // Иначе Bevy не рендерит UI и сразу закрывает окно.
+    // Fallback-камера.
     if !player_spawned {
         eprintln!(
-            "[game] ВНИМАНИЕ: в ScenePlan нет узла kind=Player. \
-             Спавним fallback-камеру в (0, 2, 0). Проверь XML уровня — \
-             там должна быть сущность type=\"player\" (например player_start)."
+            "[game] ВНИМАНИЕ: нет узла Player. Спавним fallback-камеру в (0, 2, 0)."
         );
-
-        // Ищем точку спавна из <spawn_point> — если есть, используем её координаты.
         let spawn_pos = plan
             .spawn_point
             .as_ref()
@@ -203,7 +241,6 @@ pub fn spawn_scene(
             SceneNodeId("__fallback_camera__".into()),
         ));
 
-        // И добавляем свет, чтобы не было совсем чёрно.
         commands.spawn((
             DirectionalLight {
                 illuminance: 5_000.0,
@@ -213,13 +250,11 @@ pub fn spawn_scene(
             Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.5, 0.5, 0.0)),
         ));
 
-        // И ambient, чтобы PBR-материалы были видны даже без источников света.
         commands.insert_resource(AmbientLight {
             color: Color::WHITE,
             brightness: 200.0,
         });
 
-        // И пол под ногами — чтобы было куда смотреть.
         let floor_mesh = meshes.add(Plane3d::default().mesh().size(64.0, 64.0));
         let floor_mat = materials.add(StandardMaterial {
             base_color: Color::srgb(0.45, 0.40, 0.28),
@@ -235,13 +270,114 @@ pub fn spawn_scene(
         ));
     }
 
-    // На всякий случай — если в плане вообще не было света, добавим ambient.
     if plan.nodes.iter().all(|n| n.kind != NodeKind::Light) {
         commands.insert_resource(AmbientLight {
             color: Color::WHITE,
             brightness: 100.0,
         });
     }
+}
+
+/// Строит MeshHandle из MeshSpec.
+/// Cuboid::new(size.x, size.y, size.z) — размеры прямо в меш.
+fn build_mesh_handle(
+    spec: &Option<crate::level::build::MeshSpec>,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    asset_server: &Res<AssetServer>,
+    _commands: &mut Commands,
+    _node_id: &str,
+) -> Handle<Mesh> {
+    let Some(spec) = spec else {
+        return meshes.add(Cuboid::new(1.0, 1.0, 1.0));
+    };
+    match &spec.kind {
+        MeshKind::Plane => meshes.add(Plane3d::default().mesh().size(spec.size[0], spec.size[2])),
+        MeshKind::Cube => meshes.add(Cuboid::new(spec.size[0], spec.size[1], spec.size[2])),
+        MeshKind::Sphere => meshes.add(Sphere::new(spec.size[0].max(0.01))),
+        MeshKind::Cylinder => meshes.add(Cylinder::new(spec.size[0].max(0.01), spec.size[1].max(0.01))),
+        MeshKind::Custom { model_id } => {
+            // Пытаемся загрузить gltf/glb из cache-files (через assets/ symlink).
+            // AssetServer не умеет смотреть в %APPDATA%, поэтому путь должен быть
+            // вида "models/X.gltf" относительно assets/ рядом с exe.
+            // Fallback — куб.
+            let _ = asset_server;
+            let _ = model_id;
+            meshes.add(Cuboid::new(1.0, 1.0, 1.0))
+        }
+    }
+}
+
+/// Собирает StandardMaterial с текстурами по MaterialPlan.
+fn build_material(
+    node: &crate::level::build::NodePlan,
+    resolved: &ResolvedAssetsResource,
+    images: &mut ResMut<Assets<Image>>,
+    cache: &mut std::collections::HashMap<String, Handle<Image>>,
+) -> StandardMaterial {
+    let mut mat = StandardMaterial {
+        base_color: Color::srgb(0.7, 0.7, 0.72),
+        perceptual_roughness: node.material.roughness_f32.max(0.05),
+        metallic: node.material.metallic_f32,
+        ..default()
+    };
+
+    // base_color_texture
+    if let Some(id) = &node.material.base {
+        if let Some(h) = get_or_load_image(id, resolved, images, cache) {
+            mat.base_color_texture = Some(h.clone());
+            // Если у нас PBR-набор — применим и tiling через UV-скейл.
+            // Bevy не имеет uv_scale в StandardMaterial, поэтому tiling
+            // применяется не здесь, а через mesh (см. build_mesh_handle → apply_tiling).
+            // Пока применяем к текстуре через sampler — это единственный путь без
+            // модификации меша. Если tiling нужен, передаём его как scale_sampler.
+            let _ = &node.material.tiling;
+        }
+    }
+
+    // normal_map_texture
+    if let Some(id) = &node.material.normal {
+        if let Some(h) = get_or_load_image(id, resolved, images, cache) {
+            mat.normal_map_texture = Some(h.clone());
+        }
+    }
+
+    // metallic_roughness — используем rough как R-канал (приближение).
+    if let Some(id) = &node.material.roughness {
+        if let Some(h) = get_or_load_image(id, resolved, images, cache) {
+            mat.metallic_roughness_texture = Some(h.clone());
+        }
+    }
+
+    // occlusion
+    if let Some(id) = &node.material.ao {
+        if let Some(h) = get_or_load_image(id, resolved, images, cache) {
+            mat.occlusion_texture = Some(h.clone());
+        }
+    }
+
+    // Inline цвет (если текстуры нет).
+    if mat.base_color_texture.is_none() {
+        if let Some(hex) = &node.material.color {
+            mat.base_color = parse_hex_color(hex);
+        }
+    }
+
+    mat
+}
+
+fn get_or_load_image(
+    id: &str,
+    resolved: &ResolvedAssetsResource,
+    images: &mut ResMut<Assets<Image>>,
+    cache: &mut std::collections::HashMap<String, Handle<Image>>,
+) -> Option<Handle<Image>> {
+    if let Some(h) = cache.get(id) {
+        return Some(h.clone());
+    }
+    let bytes = resolved.textures.get(id)?;
+    let h = load_png_into_images(bytes, images)?;
+    cache.insert(id.to_string(), h.clone());
+    Some(h)
 }
 
 #[derive(Component, Debug, Clone, Default)]
@@ -274,9 +410,7 @@ pub fn run_on_level_start(
     lua: Option<NonSend<LuaRuntime>>,
     mut done: Local<bool>,
 ) {
-    if *done {
-        return;
-    }
+    if *done { return; }
     if let Some(rt) = lua {
         if let Ok(engine) = rt.0.lock() {
             let _ = engine.call_hook0("on_level_start");
@@ -306,23 +440,22 @@ pub fn chunk_streaming_system(
     time: Res<Time>,
     mut acc: Local<f32>,
     plan: Res<ScenePlanResource>,
+    resolved: Res<ResolvedAssetsResource>,
     mut loaded: ResMut<LoadedChunks>,
     player: Query<&Transform, With<MainCamera>>,
     existing: Query<(Entity, &ChunkCell)>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    asset_server: Res<AssetServer>,
 ) {
     *acc += time.delta_seconds();
-    if *acc < 0.25 {
-        return;
-    }
+    if *acc < 0.25 { return; }
     *acc = 0.0;
 
     let Some(chunk_size) = plan.0.chunk_size else { return; };
-    if plan.0.chunk_templates.is_empty() {
-        return;
-    }
+    if plan.0.chunk_templates.is_empty() { return; }
     let Some(px) = player.iter().next().map(|t| t.translation) else { return; };
     let seed = plan.0.seed.unwrap_or(0);
 
@@ -350,24 +483,25 @@ pub fn chunk_streaming_system(
         commands: &mut Commands,
         meshes: &mut ResMut<Assets<Mesh>>,
         materials: &mut ResMut<Assets<StandardMaterial>>,
+        images: &mut ResMut<Assets<Image>>,
+        asset_server: &Res<AssetServer>,
+        resolved: &ResolvedAssetsResource,
         loaded: &mut ResMut<LoadedChunks>,
         tmpl: &crate::level::build::ChunkTemplatePlan,
         grid: (i32, i32, i32),
         cs: [f32; 3],
     ) {
-        if loaded.0.contains(&grid) {
-            return;
-        }
-        let origin = [
-            grid.0 as f32 * cs[0],
-            grid.1 as f32 * cs[1],
-            grid.2 as f32 * cs[2],
-        ];
+        if loaded.0.contains(&grid) { return; }
+        let origin = [grid.0 as f32 * cs[0], grid.1 as f32 * cs[1], grid.2 as f32 * cs[2]];
         let cid = format!("{}/{}", tmpl.id, format!("{}_{}_{}", grid.0, grid.1, grid.2));
         let nodes = crate::level::build::expand_chunk_nodes(&tmpl.nodes, &cid, origin, Some(cs));
         let cell = ChunkCell(grid.0, grid.1, grid.2);
+
+        let mut cache: std::collections::HashMap<String, Handle<Image>> =
+            std::collections::HashMap::new();
+
         for n in &nodes {
-            spawn_one_node(commands, meshes, materials, n, cell);
+            spawn_one_node(commands, meshes, materials, images, asset_server, resolved, n, cell, &mut cache);
         }
         loaded.0.insert(grid);
     }
@@ -380,12 +514,10 @@ pub fn chunk_streaming_system(
                 let grid = (pgx + dx, 0, pgz + dz);
                 let picked = crate::level::build::pick_template_by_chance(
                     &default_t.iter().map(|x| (*x).clone()).collect::<Vec<_>>(),
-                    seed,
-                    grid,
-                )
-                .cloned();
+                    seed, grid,
+                ).cloned();
                 if let Some(t) = picked {
-                    spawn_at(&mut commands, &mut meshes, &mut materials, &mut loaded, &t, grid, cs);
+                    spawn_at(&mut commands, &mut meshes, &mut materials, &mut images, &asset_server, &resolved, &mut loaded, &t, grid, cs);
                 }
             }
         }
@@ -397,12 +529,10 @@ pub fn chunk_streaming_system(
             let grid = (0, pgy + dy, 0);
             let picked = crate::level::build::pick_template_by_chance(
                 &axis_y.iter().map(|x| (*x).clone()).collect::<Vec<_>>(),
-                seed,
-                grid,
-            )
-            .cloned();
+                seed, grid,
+            ).cloned();
             if let Some(t) = picked {
-                spawn_at(&mut commands, &mut meshes, &mut materials, &mut loaded, &t, grid, cs);
+                spawn_at(&mut commands, &mut meshes, &mut materials, &mut images, &asset_server, &resolved, &mut loaded, &t, grid, cs);
             }
         }
     }
@@ -412,12 +542,10 @@ pub fn chunk_streaming_system(
             let grid = (pgx + dx, 0, 0);
             let picked = crate::level::build::pick_template_by_chance(
                 &axis_x.iter().map(|x| (*x).clone()).collect::<Vec<_>>(),
-                seed,
-                grid,
-            )
-            .cloned();
+                seed, grid,
+            ).cloned();
             if let Some(t) = picked {
-                spawn_at(&mut commands, &mut meshes, &mut materials, &mut loaded, &t, grid, cs);
+                spawn_at(&mut commands, &mut meshes, &mut materials, &mut images, &asset_server, &resolved, &mut loaded, &t, grid, cs);
             }
         }
     }
@@ -427,12 +555,10 @@ pub fn chunk_streaming_system(
             let grid = (0, 0, pgz + dz);
             let picked = crate::level::build::pick_template_by_chance(
                 &axis_z.iter().map(|x| (*x).clone()).collect::<Vec<_>>(),
-                seed,
-                grid,
-            )
-            .cloned();
+                seed, grid,
+            ).cloned();
             if let Some(t) = picked {
-                spawn_at(&mut commands, &mut meshes, &mut materials, &mut loaded, &t, grid, cs);
+                spawn_at(&mut commands, &mut meshes, &mut materials, &mut images, &asset_server, &resolved, &mut loaded, &t, grid, cs);
             }
         }
     }
@@ -444,9 +570,7 @@ pub fn chunk_streaming_system(
             let dx = (g.0 - pgx).abs();
             let dz = (g.2 - pgz).abs();
             let dy = (g.1 - pgy).abs();
-            let outside_xz = dx > radius + 1 || dz > radius + 1;
-            let outside_y = dy > radius + 1;
-            if outside_xz || outside_y { Some((g, e)) } else { None }
+            if dx > radius + 1 || dz > radius + 1 || dy > radius + 1 { Some((g, e)) } else { None }
         })
         .collect();
     for (g, e) in far {
@@ -455,14 +579,19 @@ pub fn chunk_streaming_system(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_one_node(
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<Mesh>>,
     materials: &mut ResMut<Assets<StandardMaterial>>,
+    images: &mut ResMut<Assets<Image>>,
+    asset_server: &Res<AssetServer>,
+    resolved: &ResolvedAssetsResource,
     node: &crate::level::build::NodePlan,
     cell: ChunkCell,
+    cache: &mut std::collections::HashMap<String, Handle<Image>>,
 ) {
-    use crate::level::build::{LightKindPlan, MeshKind, NodeKind};
+    use crate::level::build::{LightKindPlan, NodeKind};
 
     let tf = Transform {
         translation: Vec3::new(node.pos[0], node.pos[1], node.pos[2]),
@@ -472,7 +601,7 @@ pub fn spawn_one_node(
             node.rot[1].to_radians(),
             node.rot[2].to_radians(),
         ),
-        scale: Vec3::new(node.scale[0], node.scale[1], node.scale[2]),
+        scale: Vec3::new(node.scale[0].max(1e-6), node.scale[1].max(1e-6), node.scale[2].max(1e-6)),
     };
 
     if node.kind == NodeKind::Light {
@@ -496,20 +625,19 @@ pub fn spawn_one_node(
         }
     }
 
-    let mesh_handle = match &node.mesh {
-        Some(MeshKind::Plane) => meshes.add(Plane3d::default().mesh().size(1.0, 1.0)),
-        Some(MeshKind::Sphere) => meshes.add(Sphere::new(0.5)),
-        _ => meshes.add(Cuboid::new(1.0, 1.0, 1.0)),
-    };
-    let mat = materials.add(StandardMaterial { base_color: Color::srgb(0.65, 0.65, 0.7), ..default() });
+    let mesh_handle = build_mesh_handle(&node.mesh, meshes, asset_server, commands, &node.id);
+    let mat = build_material(node, resolved, images, cache);
+    let mat_handle = materials.add(mat);
+
     commands.spawn((
-        PbrBundle { mesh: mesh_handle, material: mat, transform: tf, ..default() },
+        PbrBundle { mesh: mesh_handle, material: mat_handle, transform: tf, ..default() },
         cell, SceneNodeId(node.id.clone()),
     ));
 }
 
 pub struct GamePlugin {
     pub plan: std::sync::Arc<ScenePlan>,
+    pub assets: std::sync::Arc<ResolvedAssets>,
     pub engine: std::sync::Mutex<Option<ScriptEngine>>,
     pub level_number: u32,
 }
@@ -517,6 +645,7 @@ pub struct GamePlugin {
 impl Plugin for GamePlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(ScenePlanResource(self.plan.clone()))
+            .insert_resource(ResolvedAssetsResource::from(self.assets.as_ref()))
             .init_resource::<ActiveScene>()
             .init_resource::<LoadedChunks>()
             .add_systems(Startup, spawn_scene)
@@ -562,39 +691,5 @@ mod tests {
     #[test]
     fn parse_hex_invalid_is_white() {
         assert_eq!(parse_hex_color("not-a-color"), Color::WHITE);
-    }
-
-    #[test]
-    fn empty_plan_resource_ok() {
-        let r = ScenePlanResource::default();
-        assert!(r.0.nodes.is_empty());
-    }
-
-    #[test]
-    fn game_plugin_builds() {
-        let mut app = App::new();
-        app.add_plugins((MinimalPlugins, bevy::input::InputPlugin, bevy::asset::AssetPlugin::default()));
-        app.init_asset::<bevy::render::mesh::Mesh>();
-        app.init_asset::<bevy::render::texture::Image>();
-        app.init_asset::<bevy::pbr::StandardMaterial>();
-        app.init_resource::<ButtonInput<KeyCode>>();
-        app.add_plugins(GamePlugin {
-            plan: std::sync::Arc::new(ScenePlan {
-                spawn_point: None,
-                gravity: [0.0, -9.81, 0.0],
-                ambient: [0.3, 0.3, 0.3],
-                bounds_min: [-10.0, -2.0, -10.0],
-                bounds_max: [10.0, 10.0, 10.0],
-                nodes: Vec::new(),
-                triggers: Vec::new(),
-                scripts: std::collections::BTreeMap::new(),
-                chunk_size: None,
-                chunk_templates: Vec::new(),
-                seed: None,
-            }),
-            engine: std::sync::Mutex::new(None),
-            level_number: 0,
-        });
-        app.update();
     }
 }

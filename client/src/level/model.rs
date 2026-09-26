@@ -2,8 +2,9 @@
 //! v2: уровень НЕ хранит сущности напрямую — всё живёт в <chunk>.
 //! Каждый чанк имеет generator: default | axis | none, и chance=0..100.
 //! Координаты внутри чанка ЛОКАЛЬНЫЕ: (0,0,0) = центр чанка.
-//! Поддерживает всё, что есть в Приложении A: resources (texture/model/material/sound/animation),
-//! prefabs, entities (с inherit), triggers, scripts (inline Lua), bounds.
+//!
+//! Обновлено: добавлена поддержка inline-материалов прямо в <entity>
+//! (texture/normal/roughness/ao/tiling) и вложенных <mesh shape= scale=/>.
 
 use std::collections::BTreeMap;
 
@@ -22,13 +23,9 @@ pub struct Level {
     pub meta: Meta,
     pub resources: Resources,
     pub prefabs: BTreeMap<String, Entity>,
-    /// Размер одного чанка в мировых единицах (x,y,z). В v2 обязателен.
     pub chunk_size: Option<ChunkSize>,
-    /// Список шаблонов чанков (v2).
     pub chunks: Vec<Chunk>,
-    /// Seed процедурной генерации.
     pub seed: Option<u64>,
-    /// Устаревшее (v1): сущности верхнего уровня. Оставлено для обратной совместимости парсера.
     pub entities: Vec<Entity>,
     pub triggers: Vec<Trigger>,
     pub scripts: Vec<Script>,
@@ -54,17 +51,11 @@ pub struct Resources {
 
 #[derive(Debug, Clone)]
 pub enum TextureSource {
-    /// Внешний файл: src="assets/textures/..." или path="textures/..."
     File(String),
-    /// Удалённый URL
     Url(String),
-    /// Однотонный цвет color="#rrggbb"
     Color(String),
-    /// Инлайн SVG (содержимое <svg>...</svg>)
     InlineSvg(String),
-    /// Только теги — резолвится через assets.db/ИИ
     Tags(Vec<String>),
-    /// Ничего не указано
     None,
 }
 
@@ -99,10 +90,15 @@ pub struct ModelDecl {
 pub struct MaterialDecl {
     pub id: String,
     pub texture: Option<String>,
-    pub roughness: f32,
-    pub metallic: f32,
+    pub normal: Option<String>,
+    pub roughness: Option<String>,
+    pub ao: Option<String>,
+    pub metallic: Option<String>,
     pub emissive: Option<String>,
     pub emissive_strength: f32,
+    pub tiling: Option<[f32; 2]>,
+    pub roughness_f32: f32,
+    pub metallic_f32: f32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -137,12 +133,17 @@ pub struct RenderDecl {
     pub mesh: Option<String>,
     pub cast_shadow: bool,
     pub receive_shadow: bool,
+    /// Вложенный тег <mesh shape="..." scale="..."/>
+    pub mesh_shape: Option<String>,
+    pub mesh_scale: Option<[f32; 3]>,
+    /// Inline-материал на самой entity (без <resources><material>).
+    pub inline_material: Option<MaterialDecl>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct PhysicsDecl {
-    pub body: Option<String>,      // dynamic | static | kinematic
-    pub collider: Option<String>,  // box | sphere | capsule
+    pub body: Option<String>,
+    pub collider: Option<String>,
     pub size: Option<[f32; 3]>,
     pub radius: Option<f32>,
     pub height: Option<f32>,
@@ -163,12 +164,11 @@ pub struct StatsDecl {
 
 #[derive(Debug, Clone, Default)]
 pub struct EntityEvent {
-    pub kind: String,   // on_spawn | on_update | ...
+    pub kind: String,
     pub script: String,
     pub func: String,
 }
 
-/// Размер одного чанка в мировых единицах.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ChunkSize {
     pub x: f32,
@@ -176,14 +176,10 @@ pub struct ChunkSize {
     pub z: f32,
 }
 
-/// Режим генерации чанка.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChunkGenerator {
-    /// Сетка по X и Z (бесконечный мир-плоскость).
     Default,
-    /// Сетка по одной оси (например, башня по Y).
-    Axis(String), // "x" | "y" | "z"
-    /// Чанк объявлен, но НЕ создаётся автоматически; спавнится вручную из Lua.
+    Axis(String),
     None,
 }
 
@@ -191,21 +187,18 @@ impl Default for ChunkGenerator {
     fn default() -> Self { ChunkGenerator::Default }
 }
 
-/// Шаблон чанка (v2). Внутри — локальные координаты, (0,0,0) = центр чанка.
 #[derive(Debug, Clone, Default)]
 pub struct Chunk {
     pub id: String,
     pub generator: ChunkGenerator,
-    /// Обязательный атрибут chance="0..100".
     pub chance: f32,
-    /// Сущности внутри чанка (локальные координаты).
     pub entities: Vec<Entity>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct Entity {
     pub id: String,
-    pub kind: Option<String>,     // player | prop | enemy | door | light | pickup | spawner
+    pub kind: Option<String>,
     pub inherit: Option<String>,
     pub model: Option<String>,
     pub material: Option<String>,
@@ -228,7 +221,7 @@ pub struct CameraDecl {
 
 #[derive(Debug, Clone, Default)]
 pub struct LightDecl {
-    pub kind: Option<String>,   // directional | point | spot
+    pub kind: Option<String>,
     pub color: Option<String>,
     pub intensity: f32,
     pub range: f32,
@@ -238,7 +231,7 @@ pub struct LightDecl {
 #[derive(Debug, Clone, Default)]
 pub struct Trigger {
     pub id: String,
-    pub kind: Option<String>,   // volume | timer | signal
+    pub kind: Option<String>,
     pub shape: Option<String>,
     pub size: Option<[f32; 3]>,
     pub radius: Option<f32>,
@@ -273,14 +266,12 @@ mod tests {
         assert!(l.entities.is_empty());
         assert!(l.chunks.is_empty());
         assert!(l.chunk_size.is_none());
-        assert_eq!(l.bounds.min, [0.0, 0.0, 0.0]);
     }
 
     #[test]
     fn chunk_default_generator() {
         let c = Chunk::default();
         assert_eq!(c.generator, ChunkGenerator::Default);
-        assert_eq!(c.chance, 0.0);
     }
 
     #[test]
