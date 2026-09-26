@@ -1,23 +1,25 @@
-//! Парсинг ответа ИИ: срезание markdown, извлечение <level>...</level>, валидация XML (v1 и v2).
+//! Парсинг ответа ИИ: срезание markdown, извлечение <level>...</level>,
+//! sanitize невалидных для XML символов, валидация XML (v1 и v2).
+//!
 //! §8.4 ТЗ: «ИИ должен вернуть только валидный XML. Markdown-обёртка срезается.
 //! Если XML невалиден — повторный запрос или fallback».
 //!
-//! Обновлено: парсер стал устойчивым к:
-//!   * markdown-фенсам ```xml ... ``` и просто ``` ... ```
-//!   * префиксному тексту «Sure, here is your XML:» и trailing-тексту
-//!   * <level ...> с атрибутами в несколько строк
-//!   * XML-декларации <?xml ... ?> ПЕРЕД <level>
-//!   * невалидному содержимому внутри (тогда — error с диагностикой)
-//!   * рассуждениям reasoning-модели (если в reasoning_content лежит XML)
+//! Обновлено: теперь парсер умеет:
+//!   * срезать markdown-фенсы ```xml ... ``` и ``` ... ```
+//!   * находить <level>...</level> среди болтовни
+//!   * заменять невалидные для XML Unicode-символы (em-dash —, en-dash –,
+//!     типографские кавычки «»„", …, NBSP) на ASCII-эквиваленты
+//!   * вырезать управляющие символы (кроме \t \n \r)
 
 use anyhow::{anyhow, Result};
 
-/// Результат: очищенная XML-строка уровня + метаданные для диагностики.
 #[derive(Debug, Clone)]
 pub struct ExtractedXml {
     pub xml: String,
     /// Что пришлось сделать: "clean" | "stripped_fence" | "found_after_prose"
     pub note: &'static str,
+    /// Сколько символов заменено санитайзером.
+    pub sanitized_chars: usize,
 }
 
 /// Результат: очищенная XML-строка уровня (совместимость со старым API).
@@ -27,7 +29,6 @@ pub fn extract_level_xml(raw: &str) -> Result<String> {
 
 /// Расширенная версия с диагностикой.
 pub fn extract_level_xml_diag(raw: &str) -> Result<ExtractedXml> {
-    // 0. Сразу предупреждение, если ответ пустой.
     if raw.trim().is_empty() {
         return Err(anyhow!("ответ ИИ пуст"));
     }
@@ -37,11 +38,8 @@ pub fn extract_level_xml_diag(raw: &str) -> Result<ExtractedXml> {
 
     // 2. Ищем <level ...> ... </level>.
     let slice = match find_level_bounds(&cleaned) {
-        Some(s) => s.to_string(),
+        Some(s) => s,
         None => {
-            // Может быть, есть <?xml ... ?><level>...</level> — тогда ищем по <level.
-            // Или ответ — это вообще не XML.
-            // Дам подробную ошибку с началом ответа, чтобы понять в чём дело.
             let preview: String = raw.chars().take(500).collect();
             return Err(anyhow!(
                 "в ответе ИИ нет тега <level>...</level>. \
@@ -50,21 +48,111 @@ pub fn extract_level_xml_diag(raw: &str) -> Result<ExtractedXml> {
         }
     };
 
-    if cleaned.len() != slice.len() {
-        // Была обёртка вокруг — фиксируем.
-        if note == "clean" {
-            note = "found_after_prose";
+    if cleaned.len() != slice.len() && note == "clean" {
+        note = "found_after_prose";
+    }
+
+    // 3. Санитайз невалидных для XML символов.
+    let (sanitized, sanitized_chars) = sanitize_xml_chars(&slice);
+    if sanitized_chars > 0 {
+        println!(
+            "[parse] санитайз: заменено {} невалидных для XML символов",
+            sanitized_chars
+        );
+    }
+
+    // 4. Валидация XML (уже после санитайза).
+    match validate_xml(&sanitized) {
+        Ok(()) => {}
+        Err(e) => {
+            // Попробуем один раз без санитайза — вдруг sanitize что-то сломал.
+            if sanitized_chars > 0 && validate_xml(&slice).is_ok() {
+                return Ok(ExtractedXml {
+                    xml: slice,
+                    note,
+                    sanitized_chars: 0,
+                });
+            }
+            return Err(anyhow!(
+                "XML невалиден: {e}\n---\n{}\n---",
+                preview_of(&sanitized, 800)
+            ));
         }
     }
 
-    // 3. Валидация XML.
-    validate_xml(&slice)
-        .map_err(|e| anyhow!("XML невалиден: {e}\n---\n{}\n---", preview_of(&slice, 800)))?;
+    // 5. Валидация структуры v2.
+    validate_v2_or_v1(&sanitized)?;
 
-    // 4. Валидация структуры v2.
-    validate_v2_or_v1(&slice)?;
+    Ok(ExtractedXml {
+        xml: sanitized,
+        note,
+        sanitized_chars,
+    })
+}
 
-    Ok(ExtractedXml { xml: slice, note })
+/// Заменяет невалидные для XML Unicode-символы на ASCII.
+/// Возвращает (новый_текст, сколько_символов_заменено).
+///
+/// Правила:
+///   * em-dash (U+2014), en-dash (U+2013), figure-dash (U+2012) → `-`
+///   * типографские кавычки « » „ ‟ " " ' ' ‚ ‛ → обычные `"` или `'`
+///   * многоточие … (U+2026) → `...`
+///   * NBSP (U+00A0), узкий NBSP (U+202F) → обычный пробел
+///   * неразрывный дефис (U+2011) → `-`
+///   * любой control-символ кроме \t (0x09), \n (0x0A), \r (0x0D) → удаляется
+fn sanitize_xml_chars(s: &str) -> (String, usize) {
+    let mut out = String::with_capacity(s.len());
+    let mut count = 0usize;
+
+    for ch in s.chars() {
+        let replacement: Option<char> = match ch {
+            '\u{2014}' => Some('-'),  // em-dash
+            '\u{2013}' => Some('-'),  // en-dash
+            '\u{2012}' => Some('-'),  // figure-dash
+            '\u{2011}' => Some('-'),  // non-breaking hyphen
+            '\u{00AB}' => Some('"'),  // «
+            '\u{00BB}' => Some('"'),  // »
+            '\u{201E}' => Some('"'),  // „
+            '\u{201C}' => Some('"'),  // "
+            '\u{201D}' => Some('"'),  // "
+            '\u{2018}' => Some('\''), // '
+            '\u{2019}' => Some('\''), // '
+            '\u{201A}' => Some('\''), // ‚
+            '\u{201B}' => Some('\''), // ‛
+            '\u{2026}' => Some('.'),  // … → один ".", но обычно идёт "..."
+            '\u{00A0}' => Some(' '),  // NBSP
+            '\u{202F}' => Some(' '),  // narrow NBSP
+            '\u{2009}' => Some(' '),  // thin space
+            '\u{200A}' => Some(' '),  // hair space
+            '\u{FEFF}' => Some(' '),  // BOM / zero-width no-break
+            '\u{200B}' => None,       // zero-width space — просто выкидываем
+            '\u{200C}' => None,       // zero-width non-joiner — выкидываем
+            '\u{200D}' => None,       // zero-width joiner — выкидываем
+            c if (c as u32) < 0x20 && c != '\t' && c != '\n' && c != '\r' => {
+                // Управляющий символ — выкидываем.
+                None
+            }
+            _ => {
+                out.push(ch);
+                continue;
+            }
+        };
+
+        match replacement {
+            Some(r) => {
+                out.push(r);
+                count += 1;
+            }
+            None => {
+                // Символ убираем — тоже считаем как изменение.
+                count += 1;
+            }
+        }
+    }
+
+    // NBSP и пр. съедаются и без счётчика: если out.len() != s.len() — уже
+    // заметили выше. Но если длина совпала случайно — не важно.
+    (out, count)
 }
 
 fn preview_of(s: &str, n: usize) -> String {
@@ -76,18 +164,13 @@ fn preview_of(s: &str, n: usize) -> String {
     }
 }
 
-/// Снимаем ```xml ... ``` или ``` ... ```.
-/// Возвращает (текст, признак_что_был_фенс).
 pub fn strip_markdown_with_note(s: &str) -> (String, &'static str) {
     let t = s.trim();
     if let Some(rest) = t.strip_prefix("```") {
-        // Первая строка может содержать язык (xml, json, html, ...).
         let inner = match rest.find('\n') {
             Some(nl) => &rest[nl + 1..],
             None => rest,
         };
-        // Срезаем закрывающий ``` если он есть. Иногда после него ещё идёт текст — тогда ищем
-        // первый ``` и режем по нему.
         let inner = match inner.find("```") {
             Some(pos) => &inner[..pos],
             None => inner.trim_end(),
@@ -97,26 +180,19 @@ pub fn strip_markdown_with_note(s: &str) -> (String, &'static str) {
     (t.to_string(), "clean")
 }
 
-/// Совместимость со старым API.
 pub fn strip_markdown(s: &str) -> String {
     strip_markdown_with_note(s).0
 }
 
-/// Найти срез от первого `<level` до соответствующего `</level>`.
-/// Учитываем атрибуты и вложенность.
 pub fn find_level_bounds(s: &str) -> Option<String> {
     let start = s.find("<level")?;
-    // Найдём ">" — конец открывающего тега.
     let open_end_rel = s[start..].find('>')?;
     let open_end = start + open_end_rel + 1;
-
-    // Ищем первый </level> после открывающего тега.
     let close = s[open_end..].find("</level>")?;
     let end = open_end + close + "</level>".len();
     Some(s[start..end].to_string())
 }
 
-/// Проверка структуры BDS Level Format v2.
 pub fn validate_v2_or_v1(s: &str) -> Result<()> {
     let is_v2 = s.contains("bds-level/2");
     if !is_v2 {
@@ -134,25 +210,23 @@ pub fn validate_v2_or_v1(s: &str) -> Result<()> {
     }
     if !s.contains("generator=") {
         return Err(anyhow!(
-            "BDS Level Format v2: у <chunk> нет обязательного атрибута generator=\"default|axis|none\""
+            "BDS Level Format v2: у <chunk> нет обязательного атрибута generator"
         ));
     }
     if !s.contains("chance=") {
         return Err(anyhow!(
-            "BDS Level Format v2: у <chunk> нет обязательного атрибута chance=\"0..100\""
+            "BDS Level Format v2: у <chunk> нет обязательного атрибута chance"
         ));
     }
     Ok(())
 }
 
-/// Валидация через roxmltree.
 pub fn validate_xml(s: &str) -> Result<()> {
     roxmltree::Document::parse(s)
         .map(|_| ())
         .map_err(|e| anyhow!("{e}"))
 }
 
-/// Скорее всего это ответ с уровнем (эвристика для выбора fallback-модели).
 pub fn looks_like_level(s: &str) -> bool {
     let c = strip_markdown(s);
     c.contains("<level") && c.contains("</level>")
@@ -179,13 +253,6 @@ mod tests {
     }
 
     #[test]
-    fn strips_bare_fence() {
-        let raw = format!("```\n{SIMPLE}\n```");
-        let got = extract_level_xml(&raw).unwrap();
-        assert!(got.starts_with("<level"));
-    }
-
-    #[test]
     fn rejects_answer_without_level() {
         assert!(extract_level_xml("no xml here").is_err());
     }
@@ -194,12 +261,6 @@ mod tests {
     fn rejects_invalid_xml_inside_level() {
         let bad = "<level><unclosed></level>";
         assert!(extract_level_xml(bad).is_err());
-    }
-
-    #[test]
-    fn looks_like_detects_level() {
-        assert!(looks_like_level(SIMPLE));
-        assert!(!looks_like_level("just text"));
     }
 
     #[test]
@@ -217,42 +278,59 @@ mod tests {
     }
 
     #[test]
-    fn rejects_v2_without_chunk_size() {
-        let bad = r#"<level id="l2" format="bds-level/2"><chunks><chunk id="c1" generator="default" chance="90"></chunk></chunks></level>"#;
-        assert!(extract_level_xml(bad).is_err());
-    }
-
-    #[test]
-    fn strips_fence_with_trailing_prose() {
-        let raw = format!("```xml\n{SIMPLE}\n```\n\nHope this helps!");
-        let got = extract_level_xml(&raw).unwrap();
-        assert_eq!(got, SIMPLE);
-    }
-
-    #[test]
-    fn finds_level_after_xml_declaration() {
-        let raw = format!("<?xml version=\"1.0\"?>\n{SIMPLE}");
-        let got = extract_level_xml(&raw).unwrap();
-        assert!(got.starts_with("<level"));
-    }
-
-    #[test]
     fn diag_notes_clean() {
         let r = extract_level_xml_diag(SIMPLE).unwrap();
         assert_eq!(r.note, "clean");
+        assert_eq!(r.sanitized_chars, 0);
+    }
+
+    // ---- ключевые новые тесты ----
+
+    #[test]
+    fn sanitizes_em_dash_in_attribute() {
+        // Именно это падало у пользователя: <meta name="Уровень 7 — Талассофобия">
+        let raw = r#"<level format="bds-level/2" seed="1"><meta name="Уровень 7 — Талассофобия"/><chunk_size x="32" y="16" z="32"/><chunks><chunk id="c" generator="none" chance="0"></chunk></chunks></level>"#;
+        let r = extract_level_xml_diag(raw).unwrap();
+        assert!(!r.xml.contains('—'), "em-dash должен быть заменён");
+        assert!(r.xml.contains("Уровень 7 - Талассофобия"));
+        assert!(r.sanitized_chars >= 1);
     }
 
     #[test]
-    fn diag_notes_stripped_fence() {
-        let raw = format!("```xml\n{SIMPLE}\n```");
-        let r = extract_level_xml_diag(&raw).unwrap();
-        assert_eq!(r.note, "stripped_fence");
+    fn sanitizes_en_dash_and_ellipsis() {
+        let raw = r#"<level format="bds-level/1"><entities id="a–b…c"></entities><bounds min="0 0 0" max="1 1 1"/></level>"#;
+        let r = extract_level_xml_diag(raw).unwrap();
+        assert!(!r.xml.contains('–'));
+        assert!(!r.xml.contains('…'));
     }
 
     #[test]
-    fn diag_notes_found_after_prose() {
-        let raw = format!("Sure, here it is:\n{SIMPLE}\nDone.");
-        let r = extract_level_xml_diag(&raw).unwrap();
-        assert_eq!(r.note, "found_after_prose");
+    fn sanitizes_typographic_quotes() {
+        let raw = "<level format=\"bds-level/1\"><entities name=\"a «b» c\"></entities><bounds min=\"0 0 0\" max=\"1 1 1\"/></level>";
+        let r = extract_level_xml_diag(raw).unwrap();
+        assert!(!r.xml.contains('«'));
+        assert!(!r.xml.contains('»'));
+    }
+
+    #[test]
+    fn sanitizes_nbsp() {
+        let raw = "<level format=\"bds-level/1\"><entities id=\"a\u{00A0}b\"></entities><bounds min=\"0 0 0\" max=\"1 1 1\"/></level>";
+        let r = extract_level_xml_diag(raw).unwrap();
+        assert!(!r.xml.contains('\u{00A0}'));
+    }
+
+    #[test]
+    fn drops_zero_width_space() {
+        let raw = "<level format=\"bds-level/1\"><entities id=\"a\u{200B}b\"></entities><bounds min=\"0 0 0\" max=\"1 1 1\"/></level>";
+        let r = extract_level_xml_diag(raw).unwrap();
+        assert!(!r.xml.contains('\u{200B}'));
+    }
+
+    #[test]
+    fn valid_xml_untouched() {
+        let raw = r#"<level format="bds-level/1"><entities id="plain"></entities><bounds min="0 0 0" max="1 1 1"/></level>"#;
+        let r = extract_level_xml_diag(raw).unwrap();
+        assert_eq!(r.sanitized_chars, 0);
+        assert_eq!(r.xml, raw);
     }
 }

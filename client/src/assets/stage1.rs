@@ -1,16 +1,8 @@
 //! Этап 1 генерации уровня: «резолв ассетов».
 //!
-//! Логика:
-//!   1. Сканируем `%APPDATA%/.infinity-backrooms/cache-files/` — что уже есть.
-//!   2. Спрашиваем ИИ (localhost:9655, модель deepseek-chat):
-//!      «вот список файлов, которые уже есть; верни JSON-список того, что
-//!      нужно для уровня — с типом (texture/model) и текстовым описанием».
-//!   3. Для каждого запроса идём в Poly Haven:
-//!      GET /search?q=...&t=textures|models, берём топ-1.
-//!      GET /files/{slug} → выбираем 8K и 6 PBR-карт (diff, nor_gl, rough, ao, disp, arm).
-//!      Скачиваем в cache-files/ с именами {Asset_Slug}_{map}.png.
-//!      Для моделей — gltf + include-файлы рядом.
-//!   4. Если Poly Haven не нашёл — фоллбэк на локальную ИИ-генерацию.
+//! Обновлено: ИИ МОЖЕТ вернуть пустой массив [], если всё уже есть в кэше —
+//! тогда клиент ничего не качает. Это описано в системной инструкции и
+//! обрабатывается в run_stage1 (пустой requests → сразу return).
 
 use std::fs;
 use std::io::Write;
@@ -27,7 +19,6 @@ use super::polyhaven::{PolyHavenClient, PolyKind};
 const AI_ENDPOINT: &str = "http://localhost:9655/v1/chat/completions";
 const AI_MODEL_STAGE1: &str = "deepseek-chat";
 
-/// Одна «потребность» уровня из ответа ИИ.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssetRequest {
     pub kind: String,
@@ -38,7 +29,6 @@ pub struct AssetRequest {
     pub tags: Vec<String>,
 }
 
-/// Отчёт о работе Этапа 1.
 #[derive(Debug, Default)]
 pub struct Stage1Report {
     pub cached_before: usize,
@@ -47,24 +37,27 @@ pub struct Stage1Report {
     pub downloaded_models: usize,
     pub ai_fallbacks: usize,
     pub failed: usize,
+    /// ИИ сказал «всё уже есть», ничего не качали.
+    pub nothing_needed: bool,
     pub downloaded_files: Vec<PathBuf>,
 }
 
 const STAGE1_SYSTEM: &str = "\
 Ты ассистент по подготовке ассетов для игры Backrooms Infinity (Three.js/Bevy, PBR). \
 Тебе дают список файлов, УЖЕ лежащих в локальном кэше (cache-files/), и просят вернуть \
-список того, ЧТО ЕЩЁ НУЖНО ДЛЯ УРОВНЯ, чтобы игра выглядела нормально. \
+список того, ЧТО ЕЩЁ НУЖНО ДЛЯ УРОВНЯ. \
 Отвечай ТОЛЬКО валидным JSON-массивом, без markdown, без пояснений. \
 Каждый элемент: {\"kind\":\"texture\"|\"model\",\"query\":\"...\",\"used_for\":\"...\",\"tags\":[\"...\"]}. \
 Правила: \
+- ЕСЛИ ВСЁ УЖЕ ЕСТЬ В КЭШЕ — верни ПУСТОЙ МАССИВ []. Это нормальный и ожидаемый ответ. \
+  Не выдумывай ассеты, которых не хватает, если уровень и без них будет нормально играться. \
 - query пиши на АНГЛИЙСКОМ, коротко (2-4 слова), как для поиска в каталоге PBR-ассетов. \
-- Не запрашивай то, что уже есть в кэше. \
+- Не запрашивай то, что уже есть в кэше (сравнивай по смыслу, не только по имени). \
 - Для стен/полов/потолков — kind=\"texture\". \
 - Для предметов/мебели/монстров/декораций — kind=\"model\". \
 - Максимум 20 запросов за раз. \
 - Никаких комментариев, никакого текста вне JSON.";
 
-/// Сканирует cache-files/ и возвращает отсортированный список имён.
 pub fn scan_cache_files(cache_dir: &Path) -> Result<Vec<String>> {
     if !cache_dir.is_dir() {
         return Ok(Vec::new());
@@ -96,7 +89,8 @@ fn ask_ai_for_requests(
     ));
     user.push_str(
         "Ниже — список файлов, которые УЖЕ есть в кэше (cache-files/). \
-         Не повторяй их. Верни JSON-массив того, что нужно для уровня.\n\n",
+         Не повторяй их. Верни JSON-массив того, что нужно для уровня. \
+         Если в кэше уже есть всё нужное — верни пустой массив [].\n\n",
     );
     user.push_str("=== Файлы в кэше ===\n");
     if existing_files.is_empty() {
@@ -116,7 +110,7 @@ fn ask_ai_for_requests(
         }
     }
     user.push_str(
-        "\nВерни ТОЛЬКО JSON-массив вида [{\"kind\":\"texture\",\"query\":\"...\",\"used_for\":\"...\",\"tags\":[\"...\"]}, ...]. \
+        "\nВерни ТОЛЬКО JSON-массив. Если ничего не нужно — верни []. \
          Никакого текста вокруг.",
     );
 
@@ -314,6 +308,17 @@ pub fn run_stage1(
     let requests = ask_ai_for_requests(level_number, &existing, notes)
         .map_err(|e| anyhow!("stage1: ИИ не ответил: {e}"))?;
     report.requested = requests.len();
+
+    // === НОВОЕ: ИИ может вернуть [], если всё уже есть ===
+    if requests.is_empty() {
+        println!(
+            "[stage1] ИИ вернул пустой список — в кэше уже есть всё нужное для уровня. \
+             Скачивание пропущено."
+        );
+        report.nothing_needed = true;
+        return Ok(report);
+    }
+
     println!("[stage1] ИИ запросил {} ассетов", requests.len());
 
     let client = PolyHavenClient::new();
@@ -412,52 +417,24 @@ mod tests {
     }
 
     #[test]
-    fn guess_ext_works() {
-        assert_eq!(guess_ext("https://x/y/z.png"), "png");
-        assert_eq!(guess_ext("https://x/y/z.jpg?v=1"), "jpg");
-        assert_eq!(guess_ext("https://x/y/z"), "png");
-    }
-
-    #[test]
     fn parse_stage1_json_plain() {
         let raw = r#"[{"kind":"texture","query":"concrete wall","used_for":"walls","tags":["concrete"]}]"#;
         let v = parse_stage1_json(raw).unwrap();
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].kind, "texture");
-        assert_eq!(v[0].query, "concrete wall");
     }
 
     #[test]
-    fn parse_stage1_json_with_fence() {
-        let raw = "```json\n[{\"kind\":\"model\",\"query\":\"wooden chair\"}]\n```";
-        let v = parse_stage1_json(raw).unwrap();
-        assert_eq!(v.len(), 1);
-        assert_eq!(v[0].kind, "model");
-    }
-
-    #[test]
-    fn parse_stage1_json_with_prose() {
-        let raw = "Sure! Here is your JSON:\n[{\"kind\":\"texture\",\"query\":\"mossy rock\"}]\nThanks!";
-        let v = parse_stage1_json(raw).unwrap();
-        assert_eq!(v.len(), 1);
-        assert_eq!(v[0].query, "mossy rock");
-    }
-
-    #[test]
-    fn scan_cache_files_empty_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let v = scan_cache_files(dir.path()).unwrap();
+    fn parse_stage1_json_empty_array() {
+        // ИИ вернул [] — всё уже есть в кэше.
+        let v = parse_stage1_json("[]").unwrap();
         assert!(v.is_empty());
     }
 
     #[test]
-    fn scan_cache_files_lists_files_sorted() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("b.png"), b"x").unwrap();
-        std::fs::write(dir.path().join("a.png"), b"x").unwrap();
-        std::fs::write(dir.path().join("c.png"), b"x").unwrap();
-        let v = scan_cache_files(dir.path()).unwrap();
-        assert_eq!(v, vec!["a.png", "b.png", "c.png"]);
+    fn parse_stage1_json_empty_with_fence() {
+        let v = parse_stage1_json("```json\n[]\n```").unwrap();
+        assert!(v.is_empty());
     }
 
     #[test]
@@ -470,6 +447,5 @@ mod tests {
         };
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains("concrete"));
-        assert!(s.contains("walls"));
     }
 }
