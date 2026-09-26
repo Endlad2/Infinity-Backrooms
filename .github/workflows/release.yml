@@ -1,0 +1,227 @@
+# GitHub Actions: сборка Rust-клиента и Flutter-лаунчера под Windows,
+# затем публикация релиза с тегом гг.мм.дд.час.минута.
+#
+# Триггеры:
+#   * push в main/master с изменениями в client/ или launcher/
+#   * ручной запуск (workflow_dispatch)
+#
+# Артефакты релиза:
+#   * backrooms-client.exe            (Rust, release)
+#   * backrooms_launcher-windows.zip  (Flutter, Windows bundle)
+#   * SHA256SUMS.txt                  (контрольные суммы)
+
+name: Build & Release
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'client/**'
+      - 'launcher/**'
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+
+# Даём workflow право создавать релизы и теги.
+permissions:
+  contents: write
+
+# Не запускаем параллельно на один и тот же ref — новый пуш отменяет старый.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ============================================================
+  # 1. Сборка Rust-клиента (backrooms-client.exe)
+  # ============================================================
+  build-client:
+    name: Build Rust client (Windows)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: client
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            client/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('client/Cargo.lock', 'client/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build (release)
+        run: cargo build --release --verbose
+
+      - name: Strip & rename binary
+        shell: pwsh
+        run: |
+          $src = "target/release/backrooms-client.exe"
+          if (-not (Test-Path $src)) {
+            Write-Error "Binary not found: $src"
+            exit 1
+          }
+          Copy-Item $src "../backrooms-client.exe"
+
+      - name: Upload client artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backrooms-client
+          path: backrooms-client.exe
+          if-no-files-found: error
+
+  # ============================================================
+  # 2. Сборка Flutter-лаунчера (windows bundle → zip)
+  # ============================================================
+  build-launcher:
+    name: Build Flutter launcher (Windows)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: launcher
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: flutter pub get
+        run: flutter pub get
+
+      - name: flutter analyze
+        run: flutter analyze --no-fatal-infos
+        continue-on-error: true
+
+      - name: flutter build windows --release
+        run: flutter build windows --release
+
+      - name: Package launcher bundle
+        shell: pwsh
+        run: |
+          $bundle = "build/windows/x64/runner/Release"
+          if (-not (Test-Path $bundle)) {
+            Write-Error "Flutter bundle not found: $bundle"
+            exit 1
+          }
+          Compress-Archive -Path "$bundle/*" -DestinationPath "../backrooms_launcher-windows.zip" -Force
+
+      - name: Upload launcher artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backrooms-launcher
+          path: backrooms_launcher-windows.zip
+          if-no-files-found: error
+
+  # ============================================================
+  # 3. Публикация релиза с тегом гг.мм.дд.час.минута
+  # ============================================================
+  release:
+    name: Publish GitHub Release
+    needs: [ build-client, build-launcher ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Скачиваем оба артефакта в одну папку artifacts/
+      - name: Download client artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: backrooms-client
+          path: artifacts
+
+      - name: Download launcher artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: backrooms-launcher
+          path: artifacts
+
+      - name: List artifacts
+        run: ls -lh artifacts
+
+      # Формируем тег вида гг.мм.дд.час.минута (локальное UTC время).
+      # Пример: 2026.09.26.1542
+      - name: Compute release tag
+        id: tag
+        shell: bash
+        run: |
+          TAG="$(date -u +'%Y.%m.%d.%H%M')"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Computed tag: $TAG"
+
+      # SHA256SUMS.txt — чтобы пользователи могли проверить целостность.
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          cd artifacts
+          sha256sum backrooms-client.exe backrooms_launcher-windows.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      # Краткое описание релиза с автоматическими пометками о коммите.
+      - name: Compose release notes
+        id: notes
+        shell: bash
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          COMMIT_MSG="$(git log -1 --pretty=%s)"
+          COMMIT_SHA="$(git rev-parse --short HEAD)"
+          {
+            echo "## Backrooms Infinity — release $TAG"
+            echo ""
+            echo "**Commit:** \`$COMMIT_SHA\` — $COMMIT_MSG"
+            echo ""
+            echo "### Что внутри"
+            echo "- \`backrooms-client.exe\` — Rust + Bevy клиент."
+            echo "- \`backrooms_launcher-windows.zip\` — Flutter-лаунчер (Windows bundle)."
+            echo "- \`SHA256SUMS.txt\` — контрольные суммы."
+            echo ""
+            echo "### Установка"
+            echo "1. Распакуйте \`backrooms_launcher-windows.zip\` в любую папку."
+            echo "2. Положите \`backrooms-client.exe\` в \`%APPDATA%\\.infinity-backrooms\\\`."
+            echo "3. Запустите \`backrooms_launcher.exe\`."
+            echo ""
+            echo "> Требуется доступ к \`https://api.polyhaven.com\` и локальный"
+            echo "> OpenAI-совместимый прокси на \`http://localhost:9655\`."
+          } > RELEASE_NOTES.md
+          cat RELEASE_NOTES.md
+
+      # Собственно публикация релиза. softprops/action-gh-release сама
+      # создаёт тег, если его нет, и прикрепляет файлы.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "Backrooms Infinity ${{ steps.tag.outputs.tag }}"
+          body_path: RELEASE_NOTES.md
+          draft: false
+          prerelease: false
+          make_latest: true
+          files: |
+            artifacts/backrooms-client.exe
+            artifacts/backrooms_launcher-windows.zip
+            artifacts/SHA256SUMS.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

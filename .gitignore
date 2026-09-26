@@ -1,0 +1,21 @@
+# Rust
+/client/target/
+**/*.rs.bk
+
+# Flutter / Dart
+/launcher/.dart_tool/
+/launcher/build/
+/launcher/.packages
+/launcher/pubspec.lock
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime data
+.infinity-backrooms/
