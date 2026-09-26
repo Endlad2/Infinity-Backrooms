@@ -1,10 +1,12 @@
-//! Оркестратор генерации уровня (§6 ТЗ) — с двумя этапами.
+//! Оркестратор генерации уровня (§6 ТЗ) — с двумя этапами и подробным логом.
 //!
 //! Этап 1: `assets::stage1::run_stage1` — наполняет cache-files/ ассетами
-//!         из Poly Haven (текстуры + gltf-модели). Запускается только если
-//!         XML уровня ещё не существует (см. main.rs).
+//!         из Poly Haven. Запускается только если XML уровня ещё не существует.
 //! Этап 2: HTML вики → промт → ИИ (search → reasoner) → парсинг XML → сохранение.
 //!         В промт добавляется список файлов из cache-files/.
+//!
+//! ВАЖНО: теперь весь ответ ИИ печатается в консоль, чтобы было видно,
+//! почему парсер не смог извлечь XML.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,25 +14,105 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Result};
 
 use crate::ai::client::AiClient;
-use crate::ai::parse::extract_level_xml;
+use crate::ai::parse::{extract_level_xml_diag, looks_like_level};
 use crate::ai::prompt::{build_level_request, build_level_request_reasoner, wiki_url};
 use crate::assets::stage1::{run_stage1, scan_cache_files};
 use crate::paths::AppPaths;
 
-/// Скачать HTML страницы вики (best-effort, без паники при отсутствии сети).
+/// Скачать HTML страницы вики (best-effort).
 pub fn fetch_wiki_html(number: u32) -> Option<String> {
     let url = wiki_url(number);
+    println!("[stage2] Скачиваю HTML вики: {url}");
     match ureq::get(&url)
         .timeout(std::time::Duration::from_secs(20))
         .call()
     {
-        Ok(resp) => resp.into_string().ok(),
-        Err(_) => None,
+        Ok(resp) => {
+            let s = resp.into_string().ok();
+            match &s {
+                Some(t) => println!("[stage2] HTML вики получен ({} символов)", t.len()),
+                None => println!("[stage2] HTML вики пуст или нечитаем"),
+            }
+            s
+        }
+        Err(e) => {
+            println!("[stage2] Не удалось скачать HTML вики: {e}");
+            None
+        }
     }
 }
 
+/// Ограничение на размер ответа ИИ, который печатаем в консоль.
+const MAX_PRINT_CHARS: usize = 12_000;
+
+/// Печатает ответ ИИ в консоль с разделителями.
+/// Обрезает длинные ответы, чтобы не залить терминал.
+fn dump_ai_answer(label: &str, content: &str, reasoning: &str) {
+    println!("\n========== [stage2] {label} ==========");
+    if !content.is_empty() {
+        let shown: String = content.chars().take(MAX_PRINT_CHARS).collect();
+        println!("--- content ({} символов{}) ---", content.len(),
+            if content.len() > MAX_PRINT_CHARS { ", обрезано" } else { "" });
+        println!("{shown}");
+    } else {
+        println!("--- content: (пусто) ---");
+    }
+
+    if !reasoning.is_empty() {
+        let shown: String = reasoning.chars().take(MAX_PRINT_CHARS).collect();
+        println!("--- reasoning_content ({} символов{}) ---", reasoning.len(),
+            if reasoning.len() > MAX_PRINT_CHARS { ", обрезано" } else { "" });
+        println!("{shown}");
+    }
+    println!("========== [stage2] конец {label} ==========\n");
+}
+
+/// Попытаться извлечь XML из ответа. Возвращает Option<строка_xml>.
+/// Печатает подробную диагностику при провале.
+fn try_extract(label: &str, content: &str, reasoning: &str) -> Option<String> {
+    // 1. Сначала пробуем content.
+    if !content.trim().is_empty() {
+        match extract_level_xml_diag(content) {
+            Ok(r) => {
+                println!(
+                    "[stage2] {label}: XML извлечён из content ({}, {} символов)",
+                    r.note,
+                    r.xml.len()
+                );
+                return Some(r.xml);
+            }
+            Err(e) => {
+                println!("[stage2] {label}: не удалось извлечь XML из content: {e}");
+            }
+        }
+    }
+
+    // 2. Потом reasoning_content — reasoning-модели иногда кладут XML туда.
+    if !reasoning.trim().is_empty() {
+        match extract_level_xml_diag(reasoning) {
+            Ok(r) => {
+                println!(
+                    "[stage2] {label}: XML извлечён из reasoning_content ({}, {} символов)",
+                    r.note,
+                    r.xml.len()
+                );
+                return Some(r.xml);
+            }
+            Err(e) => {
+                println!("[stage2] {label}: не удалось извлечь XML из reasoning_content: {e}");
+            }
+        }
+    }
+
+    // 3. Быстрая эвристика — есть ли вообще <level в сыром виде.
+    if !looks_like_level(content) && !looks_like_level(reasoning) {
+        println!("[stage2] {label}: ни в content, ни в reasoning нет подстроки '<level'");
+    }
+
+    None
+}
+
 /// Сгенерировать XML уровня (без сохранения), уже имея список файлов кэша.
-/// Порядок: search-модель -> reasoner -> offline fallback.
 pub fn generate_level_xml_with_cache(
     number: u32,
     notes: Option<&str>,
@@ -40,30 +122,46 @@ pub fn generate_level_xml_with_cache(
     let wiki_html = fetch_wiki_html(number);
     let wiki_ref = wiki_html.as_deref();
 
+    // --- Попытка 1: search-модель ---
+    println!("[stage2] Запрос к модели {} ...", crate::ai::client::MODEL_LEVEL_SEARCH);
     let req = build_level_request(number, wiki_ref, notes, cached_files);
-    if let Ok(resp) = client.chat(&req) {
-        let raw = if !resp.content.trim().is_empty() {
-            resp.content.clone()
-        } else {
-            resp.reasoning_content.clone().unwrap_or_default()
-        };
-        if let Ok(xml) = extract_level_xml(&raw) {
-            return Ok(xml);
+    match client.chat(&req) {
+        Ok(resp) => {
+            dump_ai_answer("ответ (search-модель)", &resp.content, resp.reasoning_content.as_deref().unwrap_or(""));
+            if let Some(xml) = try_extract(
+                "search-модель",
+                &resp.content,
+                resp.reasoning_content.as_deref().unwrap_or(""),
+            ) {
+                return Ok(xml);
+            }
+        }
+        Err(e) => {
+            println!("[stage2] Ошибка запроса к search-модели: {e}");
         }
     }
 
+    // --- Попытка 2: reasoner ---
+    println!("[stage2] Запрос к модели {} ...", crate::ai::client::MODEL_REASONER);
     let req2 = build_level_request_reasoner(number, wiki_ref, notes, cached_files);
-    if let Ok(resp) = client.chat(&req2) {
-        let raw = if !resp.content.trim().is_empty() {
-            resp.content.clone()
-        } else {
-            resp.reasoning_content.clone().unwrap_or_default()
-        };
-        if let Ok(xml) = extract_level_xml(&raw) {
-            return Ok(xml);
+    match client.chat(&req2) {
+        Ok(resp) => {
+            dump_ai_answer("ответ (reasoner)", &resp.content, resp.reasoning_content.as_deref().unwrap_or(""));
+            if let Some(xml) = try_extract(
+                "reasoner",
+                &resp.content,
+                resp.reasoning_content.as_deref().unwrap_or(""),
+            ) {
+                return Ok(xml);
+            }
+        }
+        Err(e) => {
+            println!("[stage2] Ошибка запроса к reasoner: {e}");
         }
     }
 
+    // --- Фоллбэк ---
+    println!("[stage2] Оба запроса не дали валидный XML — использую offline fallback.");
     Ok(offline_fallback_level(number))
 }
 
@@ -85,7 +183,6 @@ pub fn generate_and_save(number: u32, notes: Option<&str>, out_path: &Path) -> R
 }
 
 /// Полный конвейер Этапа 1 + Этапа 2.
-/// Вызывается из main.rs, когда level{N}.xml ещё не существует.
 pub fn generate_level_full(
     paths: &AppPaths,
     number: u32,
@@ -107,6 +204,8 @@ pub fn generate_level_full(
 
     println!("=== Этап 2: генерация XML уровня через ИИ ===");
     let cached = scan_cache_files(&paths.cache_files_dir).unwrap_or_default();
+    println!("[stage2] Файлов в cache-files/ передано ИИ: {}", cached.len());
+
     let xml = generate_level_xml_with_cache(number, notes, &cached)?;
     let out = paths.level_xml(number);
     if let Some(parent) = out.parent() {
@@ -114,6 +213,16 @@ pub fn generate_level_full(
     }
     fs::write(&out, xml.as_bytes())?;
     println!("[stage2] XML сохранён в {}", out.display());
+    println!("[stage2] Размер XML: {} байт", xml.len());
+
+    // Проверим — не fallback ли это.
+    if xml.contains("Offline fallback") {
+        println!(
+            "[stage2] ⚠️ ВНИМАНИЕ: сохранён offline-fallback, а не ИИ-уровень. \
+             Посмотри ответ ИИ выше и проверь, что он вернул."
+        );
+    }
+
     Ok(out)
 }
 
@@ -150,6 +259,13 @@ pub fn offline_fallback_level(number: u32) -> String {
         "</chunk>",
         "<chunk id=\"chunk_spawn\" generator=\"none\" chance=\"0\">",
         "<entity inherit=\"pf_floor\" id=\"floor\"/>",
+        "<entity id=\"player_start\" type=\"player\">",
+        "<transform pos=\"0 1 0\" rot=\"0 0 0\" scale=\"1 1 1\"/>",
+        "<stats hp=\"100\" hp_max=\"100\" speed=\"5\" jump=\"6\" faction=\"players\"/>",
+        "<camera mode=\"first_person\" fov=\"75\"/>",
+        "<physics body=\"kinematic\" collider=\"capsule\" radius=\"0.4\" height=\"1.8\"/>",
+        "</entity>",
+        "<entity id=\"spawn_lamp\" type=\"light\"><transform pos=\"0 3 0\" rot=\"0 0 0\" scale=\"1 1 1\"/><light kind=\"point\" color=\"#ffe9b0\" intensity=\"3.0\" range=\"14.0\"/></entity>",
         "</chunk>",
         "</chunks>",
         "<scripts>",
@@ -171,12 +287,19 @@ mod tests {
         assert!(x.contains("chunk_size"));
         assert!(x.contains("generator=\"default\""));
         assert!(x.contains("level_7"));
+        assert!(x.contains("player_start"));
         crate::ai::parse::validate_xml(&x).expect("fallback must be valid xml");
     }
 
     #[test]
     fn wiki_url_contains_number() {
         assert!(wiki_url(5).ends_with("level-5"));
+    }
+
+    #[test]
+    fn offline_fallback_has_player() {
+        let x = offline_fallback_level(3);
+        assert!(x.contains(r#"id="player_start" type="player""#));
     }
 }
 

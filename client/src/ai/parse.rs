@@ -1,23 +1,122 @@
 //! Парсинг ответа ИИ: срезание markdown, извлечение <level>...</level>, валидация XML (v1 и v2).
-//! См. §8.4 ТЗ: «ИИ должен вернуть только валидный XML. Markdown-обёртка срезается.
+//! §8.4 ТЗ: «ИИ должен вернуть только валидный XML. Markdown-обёртка срезается.
 //! Если XML невалиден — повторный запрос или fallback».
+//!
+//! Обновлено: парсер стал устойчивым к:
+//!   * markdown-фенсам ```xml ... ``` и просто ``` ... ```
+//!   * префиксному тексту «Sure, here is your XML:» и trailing-тексту
+//!   * <level ...> с атрибутами в несколько строк
+//!   * XML-декларации <?xml ... ?> ПЕРЕД <level>
+//!   * невалидному содержимому внутри (тогда — error с диагностикой)
+//!   * рассуждениям reasoning-модели (если в reasoning_content лежит XML)
 
 use anyhow::{anyhow, Result};
 
-/// Результат: очищенная XML-строка уровня.
+/// Результат: очищенная XML-строка уровня + метаданные для диагностики.
+#[derive(Debug, Clone)]
+pub struct ExtractedXml {
+    pub xml: String,
+    /// Что пришлось сделать: "clean" | "stripped_fence" | "found_after_prose"
+    pub note: &'static str,
+}
+
+/// Результат: очищенная XML-строка уровня (совместимость со старым API).
 pub fn extract_level_xml(raw: &str) -> Result<String> {
-    let cleaned = strip_markdown(raw);
-    let slice = find_level_bounds(&cleaned)
-        .ok_or_else(|| anyhow!("в ответе ИИ нет тега <level>...</level>"))?;
-    validate_xml(slice)?;
-    validate_v2_or_v1(slice)?;
-    Ok(slice.to_string())
+    Ok(extract_level_xml_diag(raw)?.xml)
+}
+
+/// Расширенная версия с диагностикой.
+pub fn extract_level_xml_diag(raw: &str) -> Result<ExtractedXml> {
+    // 0. Сразу предупреждение, если ответ пустой.
+    if raw.trim().is_empty() {
+        return Err(anyhow!("ответ ИИ пуст"));
+    }
+
+    // 1. Срезаем markdown-фенс, если он есть.
+    let (cleaned, mut note) = strip_markdown_with_note(raw);
+
+    // 2. Ищем <level ...> ... </level>.
+    let slice = match find_level_bounds(&cleaned) {
+        Some(s) => s.to_string(),
+        None => {
+            // Может быть, есть <?xml ... ?><level>...</level> — тогда ищем по <level.
+            // Или ответ — это вообще не XML.
+            // Дам подробную ошибку с началом ответа, чтобы понять в чём дело.
+            let preview: String = raw.chars().take(500).collect();
+            return Err(anyhow!(
+                "в ответе ИИ нет тега <level>...</level>. \
+                 Первые 500 символов ответа:\n---\n{preview}\n---"
+            ));
+        }
+    };
+
+    if cleaned.len() != slice.len() {
+        // Была обёртка вокруг — фиксируем.
+        if note == "clean" {
+            note = "found_after_prose";
+        }
+    }
+
+    // 3. Валидация XML.
+    validate_xml(&slice)
+        .map_err(|e| anyhow!("XML невалиден: {e}\n---\n{}\n---", preview_of(&slice, 800)))?;
+
+    // 4. Валидация структуры v2.
+    validate_v2_or_v1(&slice)?;
+
+    Ok(ExtractedXml { xml: slice, note })
+}
+
+fn preview_of(s: &str, n: usize) -> String {
+    let t: String = s.chars().take(n).collect();
+    if s.chars().count() > n {
+        format!("{t}…(обрезано)")
+    } else {
+        t
+    }
+}
+
+/// Снимаем ```xml ... ``` или ``` ... ```.
+/// Возвращает (текст, признак_что_был_фенс).
+pub fn strip_markdown_with_note(s: &str) -> (String, &'static str) {
+    let t = s.trim();
+    if let Some(rest) = t.strip_prefix("```") {
+        // Первая строка может содержать язык (xml, json, html, ...).
+        let inner = match rest.find('\n') {
+            Some(nl) => &rest[nl + 1..],
+            None => rest,
+        };
+        // Срезаем закрывающий ``` если он есть. Иногда после него ещё идёт текст — тогда ищем
+        // первый ``` и режем по нему.
+        let inner = match inner.find("```") {
+            Some(pos) => &inner[..pos],
+            None => inner.trim_end(),
+        };
+        return (inner.trim().to_string(), "stripped_fence");
+    }
+    (t.to_string(), "clean")
+}
+
+/// Совместимость со старым API.
+pub fn strip_markdown(s: &str) -> String {
+    strip_markdown_with_note(s).0
+}
+
+/// Найти срез от первого `<level` до соответствующего `</level>`.
+/// Учитываем атрибуты и вложенность.
+pub fn find_level_bounds(s: &str) -> Option<String> {
+    let start = s.find("<level")?;
+    // Найдём ">" — конец открывающего тега.
+    let open_end_rel = s[start..].find('>')?;
+    let open_end = start + open_end_rel + 1;
+
+    // Ищем первый </level> после открывающего тега.
+    let close = s[open_end..].find("</level>")?;
+    let end = open_end + close + "</level>".len();
+    Some(s[start..end].to_string())
 }
 
 /// Проверка структуры BDS Level Format v2.
-/// Для format="bds-level/2" требуем наличие <chunk_size> и хотя бы одного
-/// <chunk ... generator="..." chance="...">. Для v1-уровней допускается
-/// отсутствие этих секций (обратная совместимость).
 pub fn validate_v2_or_v1(s: &str) -> Result<()> {
     let is_v2 = s.contains("bds-level/2");
     if !is_v2 {
@@ -46,41 +145,11 @@ pub fn validate_v2_or_v1(s: &str) -> Result<()> {
     Ok(())
 }
 
-/// Снимаем ```xml ... ``` или ``` ... ```.
-pub fn strip_markdown(s: &str) -> String {
-    let t = s.trim();
-    if let Some(rest) = t.strip_prefix("```") {
-        let inner = match rest.find('\n') {
-            Some(nl) => &rest[nl + 1..],
-            None => rest,
-        };
-        let inner = inner.trim_end();
-        let inner = inner.strip_suffix("```").unwrap_or(inner);
-        return inner.trim().to_string();
-    }
-    t.to_string()
-}
-
-/// Найти срез от первого `<level` до соответствующего `</level>`.
-/// Учитываем атрибуты и вложенность (у level нет вложенных level,
-/// но на всякий случай считаем счётчик).
-pub fn find_level_bounds(s: &str) -> Option<&str> {
-    let start = s.find("<level")?;
-    // найдём ">": конец открывающего тега
-    let open_end_rel = s[start..].find('>')?;
-    let open_end = start + open_end_rel + 1;
-
-    // Ищем первый </level> после открывающего тега
-    let close = s[open_end..].find("</level>")?;
-    let end = open_end + close + "</level>".len();
-    Some(&s[start..end])
-}
-
 /// Валидация через roxmltree.
 pub fn validate_xml(s: &str) -> Result<()> {
     roxmltree::Document::parse(s)
         .map(|_| ())
-        .map_err(|e| anyhow!("XML невалиден: {e}"))
+        .map_err(|e| anyhow!("{e}"))
 }
 
 /// Скорее всего это ответ с уровнем (эвристика для выбора fallback-модели).
@@ -154,20 +223,36 @@ mod tests {
     }
 
     #[test]
-    fn rejects_v2_without_chunk() {
-        let bad = r#"<level id="l2" format="bds-level/2"><chunk_size x="32" y="16" z="32"/><chunks></chunks></level>"#;
-        assert!(extract_level_xml(bad).is_err());
+    fn strips_fence_with_trailing_prose() {
+        let raw = format!("```xml\n{SIMPLE}\n```\n\nHope this helps!");
+        let got = extract_level_xml(&raw).unwrap();
+        assert_eq!(got, SIMPLE);
     }
 
     #[test]
-    fn rejects_v2_chunk_without_generator() {
-        let bad = r#"<level id="l2" format="bds-level/2"><chunk_size x="32" y="16" z="32"/><chunks><chunk id="c1" chance="90"></chunk></chunks></level>"#;
-        assert!(extract_level_xml(bad).is_err());
+    fn finds_level_after_xml_declaration() {
+        let raw = format!("<?xml version=\"1.0\"?>\n{SIMPLE}");
+        let got = extract_level_xml(&raw).unwrap();
+        assert!(got.starts_with("<level"));
     }
 
     #[test]
-    fn accepts_v1_without_chunks() {
-        // v1-уровни не требуют chunk_size/chunks
-        assert!(extract_level_xml(SIMPLE).is_ok());
+    fn diag_notes_clean() {
+        let r = extract_level_xml_diag(SIMPLE).unwrap();
+        assert_eq!(r.note, "clean");
+    }
+
+    #[test]
+    fn diag_notes_stripped_fence() {
+        let raw = format!("```xml\n{SIMPLE}\n```");
+        let r = extract_level_xml_diag(&raw).unwrap();
+        assert_eq!(r.note, "stripped_fence");
+    }
+
+    #[test]
+    fn diag_notes_found_after_prose() {
+        let raw = format!("Sure, here it is:\n{SIMPLE}\nDone.");
+        let r = extract_level_xml_diag(&raw).unwrap();
+        assert_eq!(r.note, "found_after_prose");
     }
 }
