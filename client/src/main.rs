@@ -230,17 +230,14 @@ fn run_bevy(
     net_ctx: Option<crate::game::NetContext>,
 ) {
     use bevy::prelude::*;
-    use bevy::window::CursorGrabMode;
 
     let mut app = App::new();
+    // ВАЖНО: не задаём cursor в конструкторе окна — тип поля
+    // может отличаться в разных минорных 0.14.x.
+    // Захват курсора делает CursorGrabPlugin при старте.
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
             title: format!("Backrooms Infinity — Level {level_number}"),
-            cursor_options: bevy::window::CursorOptions {
-                visible: false,
-                grab_mode: CursorGrabMode::Locked,
-                ..Default::default()
-            },
             ..default()
         }),
         ..default()

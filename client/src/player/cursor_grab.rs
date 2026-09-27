@@ -1,8 +1,12 @@
-//! Захват курсора мыши.
+//! Захват курсора мыши — БЕЗ упоминания типа поля `cursor`,
+//! чтобы собираться на любой 0.14.x независимо от реэкспорта CursorOptions.
 //!
-//! В Bevy 0.14 CursorOptions — поле Window.cursor_options. Тип лежит в
-//! bevy::window::CursorOptions (public). Если по какой-то причине его нет —
-//! работаем с полями напрямую через Window.cursor_options.
+//! Логика:
+//!   * при старте — курсор скрыт и захвачен (Locked);
+//!   * при потере фокуса — освобождаем;
+//!   * клик по окну (в игре) — снова захват;
+//!   * `P` — ручной toggle Locked/None;
+//!   * при открытии меню паузы (ESC) — освобождаем.
 
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, PrimaryWindow, Window};
@@ -11,14 +15,14 @@ use crate::ui::PauseState;
 
 pub fn grab_on_start(mut windows: Query<&mut Window, With<PrimaryWindow>>) {
     for mut w in windows.iter_mut() {
-        grab(&mut w.cursor_options);
+        grab(&mut w);
     }
 }
 
 pub fn release_on_unfocus(mut windows: Query<&mut Window, With<PrimaryWindow>>) {
     for mut w in windows.iter_mut() {
         if !w.focused {
-            release(&mut w.cursor_options);
+            release(&mut w);
         }
     }
 }
@@ -32,7 +36,7 @@ pub fn toggle_grab_on_click(
     if !mouse.just_pressed(MouseButton::Left) { return; }
     for mut w in windows.iter_mut() {
         if !w.focused { continue; }
-        grab(&mut w.cursor_options);
+        grab(&mut w);
     }
 }
 
@@ -42,10 +46,10 @@ pub fn toggle_grab_on_key(
 ) {
     if !keys.just_pressed(KeyCode::KeyP) { return; }
     for mut w in windows.iter_mut() {
-        if w.cursor_options.grab_mode == CursorGrabMode::Locked {
-            release(&mut w.cursor_options);
+        if w.cursor.grab_mode == CursorGrabMode::Locked {
+            release(&mut w);
         } else {
-            grab(&mut w.cursor_options);
+            grab(&mut w);
         }
     }
 }
@@ -60,21 +64,25 @@ pub fn sync_grab_with_pause(
 
     for mut w in windows.iter_mut() {
         if *state == PauseState::Playing {
-            grab(&mut w.cursor_options);
+            grab(&mut w);
         } else {
-            release(&mut w.cursor_options);
+            release(&mut w);
         }
     }
 }
 
-fn grab(c: &mut bevy::window::CursorOptions) {
-    c.visible = false;
-    c.grab_mode = CursorGrabMode::Locked;
+/// Скрываем курсор и пытаемся захватить его в окне.
+/// На Windows `Locked` иногда не поддерживается — Bevy сама сделает
+/// fallback на `Confined`, если backend не умеет Locked.
+fn grab(w: &mut Window) {
+    w.cursor.visible = false;
+    w.cursor.grab_mode = CursorGrabMode::Locked;
 }
 
-fn release(c: &mut bevy::window::CursorOptions) {
-    c.visible = true;
-    c.grab_mode = CursorGrabMode::None;
+/// Показываем курсор и отпускаем его.
+fn release(w: &mut Window) {
+    w.cursor.visible = true;
+    w.cursor.grab_mode = CursorGrabMode::None;
 }
 
 pub struct CursorGrabPlugin;
