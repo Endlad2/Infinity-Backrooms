@@ -1,8 +1,14 @@
 //! Простой HTTP-сервер на голом TCP для раздачи ассетов уровня.
+//!
+//! Endpoints:
+//!   * GET /level.xml       — XML уровня.
+//!   * GET /manifest.json   — мета (lobby_name, level_number, version).
+//!   * GET /index.json      — список файлов в cache-files/.
+//!   * GET /assets/<path>   — файл из cache-files/<path>.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -110,24 +116,7 @@ fn handle_client(
             write_response(&mut s, 200, "application/json", &data)
         }
         "/index.json" => {
-            // Список файлов в cache-files/ — нужен клиенту, чтобы знать, что качать.
-            let mut entries: Vec<String> = Vec::new();
-            let mut walk = |dir: &PathBuf, prefix: &str| -> Result<()> {
-                if !dir.is_dir() { return Ok(()); }
-                for e in std::fs::read_dir(dir)? {
-                    let e = e?;
-                    let p = e.path();
-                    let name = e.file_name().to_string_lossy().to_string();
-                    if p.is_dir() {
-                        walk(&p, &format!("{prefix}{name}/"))?;
-                    } else {
-                        entries.push(format!("{prefix}{name}"));
-                    }
-                }
-                Ok(())
-            };
-            walk(cache_dir, "")?;
-            entries.sort();
+            let entries = collect_files_recursive(cache_dir)?;
             let data = serde_json::to_vec_pretty(&serde_json::json!({ "files": entries }))?;
             write_response(&mut s, 200, "application/json", &data)
         }
@@ -137,6 +126,33 @@ fn handle_client(
         }
         _ => write_404(&mut s),
     }
+}
+
+/// Рекурсивно собирает относительные пути файлов в `dir`.
+fn collect_files_recursive(dir: &Path) -> Result<Vec<String>> {
+    let mut entries: Vec<String> = Vec::new();
+    if !dir.is_dir() {
+        return Ok(entries);
+    }
+    fn walk(base: &Path, current: &Path, prefix: &str, out: &mut Vec<String>) -> Result<()> {
+        if !current.is_dir() { return Ok(()); }
+        for e in std::fs::read_dir(current)? {
+            let e = e?;
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().to_string();
+            // Защита: если по какой-то причине вышли за пределы base.
+            if !p.starts_with(base) { continue; }
+            if p.is_dir() {
+                walk(base, &p, &format!("{prefix}{name}/"), out)?;
+            } else {
+                out.push(format!("{prefix}{name}"));
+            }
+        }
+        Ok(())
+    }
+    walk(dir, dir, "", &mut entries)?;
+    entries.sort();
+    Ok(entries)
 }
 
 fn serve_asset(s: &mut TcpStream, cache_dir: &PathBuf, rel: &str) -> Result<()> {
@@ -236,7 +252,6 @@ pub fn download_file(base_url: &str, rel_path: &str, out_dir: &PathBuf) -> Resul
     Ok(full)
 }
 
-/// Скачать список файлов хоста.
 pub fn fetch_index(base_url: &str) -> Result<Vec<String>> {
     let url = format!("{}/index.json", base_url.trim_end_matches('/'));
     let resp = ureq::get(&url)
@@ -295,6 +310,7 @@ pub fn base_url_for_self(port: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn url_decode_basic() {
@@ -313,5 +329,25 @@ mod tests {
     fn base_url_for_self_returns_something() {
         let s = base_url_for_self(27016);
         assert!(s.starts_with("http://"));
+    }
+
+    #[test]
+    fn collect_files_recursive_flat() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), b"x").unwrap();
+        std::fs::write(dir.path().join("b.gltf"), b"x").unwrap();
+        let v = collect_files_recursive(dir.path()).unwrap();
+        assert_eq!(v, vec!["a.png", "b.gltf"]);
+    }
+
+    #[test]
+    fn collect_files_recursive_nested() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("Model_files/textures")).unwrap();
+        std::fs::write(dir.path().join("Model_files/model.gltf"), b"x").unwrap();
+        std::fs::write(dir.path().join("Model_files/textures/diff.png"), b"x").unwrap();
+        let v = collect_files_recursive(dir.path()).unwrap();
+        assert!(v.contains(&"Model_files/model.gltf".to_string()));
+        assert!(v.contains(&"Model_files/textures/diff.png".to_string()));
     }
 }

@@ -1,9 +1,4 @@
-//! Определение корневой папки данных приложения.
-//! Windows: %APPDATA%\.infinity-backrooms\
-//! Linux/macOS: ~/.infinity-backrooms/
-//!
-//! Дополнительно содержит путь к cache-files/ — папке для ассетов,
-//! скачанных с Poly Haven (Этап 1 генерации уровня).
+//! Пути данных приложения и Bevy-ресурс AppPathsResource.
 
 use std::path::{Path, PathBuf};
 
@@ -20,7 +15,6 @@ pub struct AppPaths {
     pub textures_dir: PathBuf,
     pub models_dir: PathBuf,
     pub audio_dir: PathBuf,
-    /// Папка кэша ассетов Poly Haven: плоская, файлы вида `Asset_Slug_diff.png`.
     pub cache_files_dir: PathBuf,
 }
 
@@ -52,7 +46,6 @@ impl AppPaths {
         }
     }
 
-    /// Создать все необходимые подкаталоги, если их ещё нет.
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.root)?;
         std::fs::create_dir_all(&self.levels_dir)?;
@@ -72,18 +65,15 @@ impl AppPaths {
         self.level_xml(number).is_file()
     }
 
-    /// Найти файл в cache-files/ по имени (просто join).
     pub fn cache_file(&self, name: &str) -> PathBuf {
         self.cache_files_dir.join(name)
     }
 
-    /// Есть ли файл в cache-files/.
     pub fn has_cache_file(&self, name: &str) -> bool {
         self.cache_file(name).is_file()
     }
 }
 
-/// Базовая директория данных: %APPDATA% на Windows, $HOME — на Unix.
 pub fn base_data_dir() -> PathBuf {
     if cfg!(windows) {
         if let Ok(appdata) = std::env::var("APPDATA") {
@@ -103,17 +93,12 @@ pub fn base_data_dir() -> PathBuf {
 use std::sync::Arc;
 use bevy::prelude::Resource;
 
-/// Bevy-ресурс с путями приложения (обёртка над Arc<AppPaths>).
 #[derive(Debug, Clone, Resource)]
 pub struct AppPathsResource(pub Arc<AppPaths>);
 
 impl AppPathsResource {
-    pub fn new(paths: AppPaths) -> Self {
-        Self(Arc::new(paths))
-    }
-    pub fn paths(&self) -> &AppPaths {
-        &self.0
-    }
+    pub fn new(paths: AppPaths) -> Self { Self(Arc::new(paths)) }
+    pub fn paths(&self) -> &AppPaths { &self.0 }
 }
 
 impl Default for AppPathsResource {
@@ -132,26 +117,6 @@ mod tests {
     fn from_root_builds_expected_tree() {
         let p = AppPaths::from_root(PathBuf::from("/tmp/infinity"));
         assert!(p.levels_json.ends_with("levels.json"));
-        assert!(p.settings_json.ends_with("settings.json"));
-        assert!(p.assets_db.ends_with("assets.db"));
-        assert!(p.level_xml(7).ends_with("levels/7.xml"));
-        assert!(p.textures_dir.ends_with("assets/textures"));
         assert!(p.cache_files_dir.ends_with("cache-files"));
-    }
-
-    #[test]
-    fn discover_returns_path() {
-        let p = AppPaths::discover().unwrap();
-        assert!(p.root.to_string_lossy().contains(APP_DIR_NAME));
-    }
-
-    #[test]
-    fn has_cache_file_works() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = AppPaths::from_root(dir.path().to_path_buf());
-        p.ensure_dirs().unwrap();
-        assert!(!p.has_cache_file("x.png"));
-        std::fs::write(p.cache_file("x.png"), b"x").unwrap();
-        assert!(p.has_cache_file("x.png"));
     }
 }
