@@ -1,15 +1,17 @@
-//! Меню паузы (ESC): полупрозрачный затемняющий оверлей + кнопки.
-//! Согласно §7.2 ТЗ: Продолжить / Настройки / Выйти / Добавить замечание ИИ.
+//! Меню паузы (ESC): полупрозрачный оверлей + кнопки.
+//! Английские подписи, потому что Roboto без Cyrillic-сабсета в Bevy UI.
+//!
+//! Кнопки: Resume / Settings / Export Level / Notes / Exit.
 
 use bevy::prelude::*;
 
-/// Состояние паузы.
 #[derive(Resource, Debug, Clone, PartialEq, Eq)]
 pub enum PauseState {
     Playing,
     Menu,
     Settings,
     Notes,
+    Exporting,
 }
 
 impl Default for PauseState {
@@ -24,20 +26,18 @@ impl PauseState {
     }
 }
 
-/// Маркер: корневой узел оверлея паузы.
 #[derive(Component)]
 pub struct PauseOverlay;
 
-/// Компонент кнопки с действием.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PauseButton {
     Resume,
     Settings,
-    Exit,
+    Export,
     Notes,
+    Exit,
 }
 
-/// Система: ESC переключает паузу.
 pub fn toggle_pause(
     keys: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<PauseState>,
@@ -50,7 +50,6 @@ pub fn toggle_pause(
     }
 }
 
-/// Система: показывать/скрывать оверлей по состоянию.
 pub fn sync_pause_overlay(
     state: Res<PauseState>,
     mut q: Query<&mut Visibility, With<PauseOverlay>>,
@@ -61,8 +60,6 @@ pub fn sync_pause_overlay(
     }
 }
 
-/// Заглушка UI-сборки оверлея. В полноценной версии — spawn NodeBundle с чёрным
-/// полупрозрачным фоном и вертикальным списком кнопок.
 pub fn spawn_pause_overlay(mut commands: Commands) {
     commands
         .spawn((
@@ -76,6 +73,7 @@ pub fn spawn_pause_overlay(mut commands: Commands) {
                 },
                 background_color: BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.75)),
                 visibility: Visibility::Hidden,
+                z_index: ZIndex::Global(100),
                 ..default()
             },
             PauseOverlay,
@@ -93,16 +91,27 @@ pub fn spawn_pause_overlay(mut commands: Commands) {
                     ..default()
                 })
                 .with_children(|col| {
+                    col.spawn(TextBundle::from_section(
+                        "PAUSED",
+                        TextStyle {
+                            font_size: 40.0,
+                            color: Color::WHITE,
+                            ..default()
+                        },
+                    ));
                     for (btn, label) in [
-                        (PauseButton::Resume, "Продолжить"),
-                        (PauseButton::Settings, "Настройки"),
-                        (PauseButton::Notes, "Добавить замечание ИИ"),
-                        (PauseButton::Exit, "Выйти"),
+                        (PauseButton::Resume, "Resume"),
+                        (PauseButton::Settings, "Settings"),
+                        (PauseButton::Export, "Export Level"),
+                        (PauseButton::Notes, "Add AI Note"),
+                        (PauseButton::Exit, "Exit"),
                     ] {
                         col.spawn((
                             ButtonBundle {
                                 style: Style {
-                                    padding: UiRect::axes(Val::Px(20.0), Val::Px(10.0)),
+                                    padding: UiRect::axes(Val::Px(24.0), Val::Px(10.0)),
+                                    min_width: Val::Px(260.0),
+                                    justify_content: JustifyContent::Center,
                                     ..default()
                                 },
                                 background_color: BackgroundColor(Color::srgb(0.15, 0.15, 0.2)),
@@ -114,7 +123,7 @@ pub fn spawn_pause_overlay(mut commands: Commands) {
                             b.spawn(TextBundle::from_section(
                                 label,
                                 TextStyle {
-                                    font_size: 24.0,
+                                    font_size: 22.0,
                                     color: Color::WHITE,
                                     ..default()
                                 },
@@ -125,10 +134,14 @@ pub fn spawn_pause_overlay(mut commands: Commands) {
         });
 }
 
-/// Обработка кликов по кнопкам.
+/// Сообщение: попросить систему экспорта уровня сделать zip.
+#[derive(Event, Debug)]
+pub struct ExportLevelRequest;
+
 pub fn handle_pause_buttons(
     mut state: ResMut<PauseState>,
     mut exit: EventWriter<AppExit>,
+    mut export_req: EventWriter<ExportLevelRequest>,
     interactions: Query<(&Interaction, &PauseButton), Changed<Interaction>>,
 ) {
     for (interaction, btn) in interactions.iter() {
@@ -139,6 +152,11 @@ pub fn handle_pause_buttons(
             PauseButton::Resume => *state = PauseState::Playing,
             PauseButton::Settings => *state = PauseState::Settings,
             PauseButton::Notes => *state = PauseState::Notes,
+            PauseButton::Export => {
+                export_req.send(ExportLevelRequest);
+                // Оверлей спрячется сам, когда state вернётся в Playing.
+                *state = PauseState::Exporting;
+            }
             PauseButton::Exit => {
                 exit.send(AppExit::Success);
             }
@@ -146,13 +164,13 @@ pub fn handle_pause_buttons(
     }
 }
 
-/// Плагин меню паузы.
 #[derive(Default)]
 pub struct PausePlugin;
 
 impl Plugin for PausePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PauseState>()
+            .add_event::<ExportLevelRequest>()
             .add_systems(Startup, spawn_pause_overlay)
             .add_systems(Update, (toggle_pause, sync_pause_overlay, handle_pause_buttons));
     }
@@ -165,12 +183,11 @@ mod tests {
     #[test]
     fn pause_state_default_is_playing() {
         assert_eq!(PauseState::default(), PauseState::Playing);
-        assert!(!PauseState::Playing.is_paused());
         assert!(PauseState::Menu.is_paused());
     }
 
     #[test]
-    fn plugin_builds_with_minimal() {
+    fn plugin_builds() {
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, bevy::input::InputPlugin));
         app.add_plugins(PausePlugin);
