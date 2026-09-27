@@ -1,17 +1,16 @@
-//! Оркестратор Этапа 2 (генерация XML).
+//! Оркестратор Этапа 2.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 
 use crate::ai::client::AiClient;
 use crate::ai::parse::{extract_level_xml_diag, looks_like_level};
 use crate::ai::prompt::{build_level_request, build_level_request_reasoner, wiki_url};
-use crate::assets::stage1::{fetch_wiki_html, run_stage1, scan_cache_files};
+use crate::assets::stage1::{fetch_wiki_html, run_stage1_with_wiki, scan_cache_files};
 use crate::paths::AppPaths;
 
-/// Публичный интерфейс — оставляем для совместимости.
 pub fn fetch_wiki_html_pub(number: u32) -> Option<String> {
     fetch_wiki_html(number)
 }
@@ -124,11 +123,9 @@ pub fn generate_level_full(
     resolution: &str,
 ) -> Result<PathBuf> {
     println!("=== Этап 1: резолв ассетов через Poly Haven ===");
-
-    // Один раз качаем HTML вики — используется и на Этапе 1, и на Этапе 2.
     let wiki_html = fetch_wiki_html(number);
 
-    match run_stage1_with_html(paths, number, notes, resolution, wiki_html.as_deref()) {
+    match run_stage1_with_wiki(paths, number, notes, resolution, wiki_html.as_deref()) {
         Ok(rep) => {
             println!(
                 "[stage1] Готово: {} текстур, {} моделей, {} ИИ-фоллбэков, wiki={} симв.",
@@ -156,22 +153,10 @@ pub fn generate_level_full(
     println!("[stage2] Размер XML: {} байт", xml.len());
 
     if xml.contains("Offline fallback") {
-        println!("[stage2] ⚠️ сохранён offline-fallback, а не ИИ-уровень.");
+        println!("[stage2] ⚠️ сохранён offline-fallback.");
     }
 
     Ok(out)
-}
-
-/// Обёртка над run_stage1, которая принимает уже скачанный HTML,
-/// чтобы не делать повторный HTTP-запрос.
-pub fn run_stage1_with_html(
-    paths: &AppPaths,
-    number: u32,
-    notes: Option<&str>,
-    resolution: &str,
-    wiki_html: Option<&str>,
-) -> Result<crate::assets::stage1::Stage1Report> {
-    crate::assets::stage1::run_stage1_with_wiki(paths, number, notes, resolution, wiki_html)
 }
 
 pub fn offline_fallback_level(number: u32) -> String {

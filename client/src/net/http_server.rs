@@ -1,12 +1,6 @@
 //! Простой HTTP-сервер на голом TCP для раздачи ассетов уровня.
-//!
-//! Endpoints:
-//!   * GET /level.xml       — XML уровня.
-//!   * GET /manifest.json   — мета (lobby_name, level_number, version).
-//!   * GET /index.json      — список файлов в cache-files/.
-//!   * GET /assets/<path>   — файл из cache-files/<path>.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -128,19 +122,15 @@ fn handle_client(
     }
 }
 
-/// Рекурсивно собирает относительные пути файлов в `dir`.
 fn collect_files_recursive(dir: &Path) -> Result<Vec<String>> {
     let mut entries: Vec<String> = Vec::new();
-    if !dir.is_dir() {
-        return Ok(entries);
-    }
+    if !dir.is_dir() { return Ok(entries); }
     fn walk(base: &Path, current: &Path, prefix: &str, out: &mut Vec<String>) -> Result<()> {
         if !current.is_dir() { return Ok(()); }
         for e in std::fs::read_dir(current)? {
             let e = e?;
             let p = e.path();
             let name = e.file_name().to_string_lossy().to_string();
-            // Защита: если по какой-то причине вышли за пределы base.
             if !p.starts_with(base) { continue; }
             if p.is_dir() {
                 walk(base, &p, &format!("{prefix}{name}/"), out)?;
@@ -157,7 +147,6 @@ fn collect_files_recursive(dir: &Path) -> Result<Vec<String>> {
 
 fn serve_asset(s: &mut TcpStream, cache_dir: &PathBuf, rel: &str) -> Result<()> {
     if rel.contains("..") { return write_404(s); }
-
     let full = cache_dir.join(rel);
     if !full.is_file() { return write_404(s); }
     let canon_cache = std::fs::canonicalize(cache_dir).ok();
@@ -165,7 +154,6 @@ fn serve_asset(s: &mut TcpStream, cache_dir: &PathBuf, rel: &str) -> Result<()> 
     if let (Some(cache), Some(f)) = (canon_cache, canon_full) {
         if !f.starts_with(&cache) { return write_404(s); }
     }
-
     let data = std::fs::read(&full)?;
     let mime = guess_mime(rel);
     write_response(s, 200, mime, &data)

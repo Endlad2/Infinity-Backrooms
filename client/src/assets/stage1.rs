@@ -1,8 +1,4 @@
 //! Этап 1: наполнение cache-files/ ассетами с Poly Haven.
-//!
-//! ОБНОВЛЕНО: сначала скачиваем HTML вики уровня, потом передаём его в промт
-//! для ИИ вместе со списком уже существующих файлов. Так ИИ просит именно
-//! те ассеты, что канонично нужны уровню, а не отсебятину.
 
 use std::fs;
 use std::io::Write;
@@ -177,7 +173,7 @@ pub fn download_texture(
         created.push(out);
     }
     if created.is_empty() {
-        return Err(anyhow!("Poly Haven: у {slug} не нашлось ни одной PBR-карты"));
+        return Err(anyhow!("Poly Haven: у {slug} нет ни одной PBR-карты"));
     }
     Ok(created)
 }
@@ -250,25 +246,33 @@ pub fn run_stage1(
     notes: Option<&str>,
     resolution: &str,
 ) -> Result<Stage1Report> {
+    // Публичный вход: если вызывают напрямую — HTML качаем сами.
+    let wiki_html = fetch_wiki_html(level_number);
+    run_stage1_with_wiki(paths, level_number, notes, resolution, wiki_html.as_deref())
+}
+
+/// Внутренний вход с уже скачанным HTML, чтобы не делать повторный запрос.
+pub fn run_stage1_with_wiki(
+    paths: &AppPaths,
+    level_number: u32,
+    notes: Option<&str>,
+    resolution: &str,
+    wiki_html: Option<&str>,
+) -> Result<Stage1Report> {
     let cache_dir = &paths.cache_files_dir;
     fs::create_dir_all(cache_dir)?;
 
     let mut report = Stage1Report::default();
+    report.wiki_html_len = wiki_html.map(|s| s.len()).unwrap_or(0);
 
-    // ШАГ 1: HTML вики.
-    let wiki_html = fetch_wiki_html(level_number);
-    report.wiki_html_len = wiki_html.as_ref().map(|s| s.len()).unwrap_or(0);
-
-    // ШАГ 2: список файлов в кэше.
     let existing = scan_cache_files(cache_dir)?;
     report.cached_before = existing.len();
     println!("[stage1] В cache-files/ уже {} файлов", report.cached_before);
 
-    // ШАГ 3: спрашиваем ИИ, что ещё нужно (с HTML и кэшем).
     let requests = ask_ai_for_requests(
         level_number,
         &existing,
-        wiki_html.as_deref(),
+        wiki_html,
         notes,
     ).map_err(|e| anyhow!("stage1: ИИ не ответил: {e}"))?;
     report.requested = requests.len();
@@ -280,7 +284,6 @@ pub fn run_stage1(
     }
     println!("[stage1] ИИ запросил {} ассетов", requests.len());
 
-    // ШАГ 4: скачиваем с Poly Haven.
     let client = PolyHavenClient::new();
     let mut ai_fallback_requests: Vec<AssetRequest> = Vec::new();
 
@@ -312,7 +315,7 @@ pub fn run_stage1(
         let s = serde_json::to_string_pretty(&ai_fallback_requests)?;
         fs::write(&manifest, s)?;
         println!(
-            "[stage1] {} ассетов уйдут на локальную ИИ-генерацию ({})",
+            "[stage1] {} ассетов уйдут на ИИ-генерацию ({})",
             ai_fallback_requests.len(),
             manifest.display()
         );

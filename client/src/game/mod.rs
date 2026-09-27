@@ -1,7 +1,4 @@
 //! Основной игровой модуль Bevy.
-//!
-//! Обновлено: подключён NetContext (для мультиплеера), плюс ленивая
-//! загрузка текстур.
 
 pub mod chunk_registry;
 pub mod net_context;
@@ -14,6 +11,7 @@ use crate::level::assets_bridge::ResolvedAssets;
 use crate::level::build::{ColliderPlan, LightKindPlan, MeshKind, NodeKind, ScenePlan};
 use crate::scripting::ScriptEngine;
 
+#[allow(unused_imports)]
 pub use net_context::{NetContext, NetRole};
 
 #[derive(Resource, Default)]
@@ -115,7 +113,7 @@ pub fn spawn_scene(
         };
 
         if node.kind == NodeKind::Light {
-            if let Some((kind, color, intensity, range)) = &node.light {
+            if let Some((kind, color, intensity, range, _flicker)) = &node.light {
                 let c = parse_hex_color(color);
                 match kind {
                     LightKindPlan::Directional => {
@@ -554,7 +552,7 @@ pub fn spawn_one_node(
     };
 
     if node.kind == NodeKind::Light {
-        if let Some((kind, color, intensity, range)) = &node.light {
+        if let Some((kind, color, intensity, range, _flicker)) = &node.light {
             let c = parse_hex_color(color);
             match kind {
                 LightKindPlan::Directional => {
@@ -584,7 +582,6 @@ pub fn spawn_one_node(
     ));
 }
 
-/// Система: обработать нажатие «Export Level» из меню паузы.
 pub fn handle_export_request(
     mut events: EventReader<crate::ui::ExportLevelRequest>,
     paths: Option<Res<crate::paths::AppPathsResource>>,
@@ -598,7 +595,6 @@ pub fn handle_export_request(
         match crate::level::export::export_level_zip(paths.paths(), active.level_number) {
             Ok(zip) => {
                 println!("[export] zip готов: {}", zip.display());
-                // Открываем save-dialog.
                 let default_name = format!("level_{}.zip", active.level_number);
                 match crate::level::export_dialog::show_save_dialog(&default_name) {
                     Some(target) => {
@@ -607,9 +603,7 @@ pub fn handle_export_request(
                             Err(e) => eprintln!("[export] ошибка копирования: {e}"),
                         }
                     }
-                    None => {
-                        println!("[export] пользователь отменил; файл остался в {}", zip.display());
-                    }
+                    None => println!("[export] отменено; файл в {}", zip.display()),
                 }
             }
             Err(e) => eprintln!("[export] ошибка: {e}"),
@@ -650,8 +644,6 @@ impl Plugin for GamePlugin {
         }
 
         if let Some(ctx) = &self.net_ctx {
-            // Клонируем — NetContext не Clone из-за реестра, но нам нужен
-            // уникальный инстанс. Пересоздаём.
             let cloned = NetContext {
                 role: ctx.role,
                 host_base_url: ctx.host_base_url.clone(),
