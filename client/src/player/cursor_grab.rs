@@ -1,33 +1,24 @@
 //! Захват курсора мыши.
 //!
-//! Логика:
-//!   * При старте (в системе Startup) — курсор скрыт и захвачен (Locked).
-//!   * Если окно потеряло фокус — освобождаем.
-//!   * По клику на окно — снова Locked.
-//!   * По нажатию ESC в меню паузы (PauseState != Playing) — освобождаем.
-//!   * По нажатию P в игре — toggle Locked/None.
-//!
-//! На Windows `CursorGrabMode::Locked` иногда не поддерживается —
-//! используем fallback на `Confined`.
+//! В Bevy 0.14 CursorOptions — поле Window.cursor_options. Тип лежит в
+//! bevy::window::CursorOptions (public). Если по какой-то причине его нет —
+//! работаем с полями напрямую через Window.cursor_options.
 
 use bevy::prelude::*;
-use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
+use bevy::window::{CursorGrabMode, PrimaryWindow, Window};
 
 use crate::ui::PauseState;
 
 pub fn grab_on_start(mut windows: Query<&mut Window, With<PrimaryWindow>>) {
-    for mut window in windows.iter_mut() {
-        grab(&mut window.cursor_options);
+    for mut w in windows.iter_mut() {
+        grab(&mut w.cursor_options);
     }
 }
 
-pub fn release_on_unfocus(
-    mut windows: Query<&mut Window, With<PrimaryWindow>>,
-) {
-    // Реакция на Focused: если окно не в фокусе — освободить курсор.
-    for mut window in windows.iter_mut() {
-        if !window.focused {
-            release(&mut window.cursor_options);
+pub fn release_on_unfocus(mut windows: Query<&mut Window, With<PrimaryWindow>>) {
+    for mut w in windows.iter_mut() {
+        if !w.focused {
+            release(&mut w.cursor_options);
         }
     }
 }
@@ -37,12 +28,11 @@ pub fn toggle_grab_on_click(
     state: Res<PauseState>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
 ) {
-    // Только если не в паузе.
     if *state != PauseState::Playing { return; }
     if !mouse.just_pressed(MouseButton::Left) { return; }
-    for mut window in windows.iter_mut() {
-        if !window.focused { continue; }
-        grab(&mut window.cursor_options);
+    for mut w in windows.iter_mut() {
+        if !w.focused { continue; }
+        grab(&mut w.cursor_options);
     }
 }
 
@@ -51,16 +41,15 @@ pub fn toggle_grab_on_key(
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
 ) {
     if !keys.just_pressed(KeyCode::KeyP) { return; }
-    for mut window in windows.iter_mut() {
-        if window.cursor_options.grab_mode == CursorGrabMode::Locked {
-            release(&mut window.cursor_options);
+    for mut w in windows.iter_mut() {
+        if w.cursor_options.grab_mode == CursorGrabMode::Locked {
+            release(&mut w.cursor_options);
         } else {
-            grab(&mut window.cursor_options);
+            grab(&mut w.cursor_options);
         }
     }
 }
 
-/// Синхронизация с состоянием паузы: Menu/Settings/Notes → курсор свободен.
 pub fn sync_grab_with_pause(
     state: Res<PauseState>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
@@ -69,22 +58,21 @@ pub fn sync_grab_with_pause(
     if last_state.as_ref() == Some(&*state) { return; }
     *last_state = Some(state.clone());
 
-    for mut window in windows.iter_mut() {
+    for mut w in windows.iter_mut() {
         if *state == PauseState::Playing {
-            grab(&mut window.cursor_options);
+            grab(&mut w.cursor_options);
         } else {
-            release(&mut window.cursor_options);
+            release(&mut w.cursor_options);
         }
     }
 }
 
-fn grab(c: &mut CursorOptions) {
+fn grab(c: &mut bevy::window::CursorOptions) {
     c.visible = false;
-    // Пробуем Locked, при неудаче — Confined (Windows).
     c.grab_mode = CursorGrabMode::Locked;
 }
 
-fn release(c: &mut CursorOptions) {
+fn release(c: &mut bevy::window::CursorOptions) {
     c.visible = true;
     c.grab_mode = CursorGrabMode::None;
 }

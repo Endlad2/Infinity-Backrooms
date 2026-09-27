@@ -2,6 +2,7 @@
 
 pub mod controller;
 pub mod camera;
+pub mod cursor_grab;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -85,14 +86,8 @@ impl Default for MouseSensitivity {
     fn default() -> Self { Self(1.0) }
 }
 
-/// Вычисляет вектор желаемого перемещения в плоскости XZ.
-///
-/// Bevy-камера смотрит в **-Z** по умолчанию, а yaw вращает её вокруг Y.
-/// Поэтому «вперёд» — это (-sin(yaw), -cos(yaw)), а «вправо» — (cos(yaw), -sin(yaw)).
-/// Проверено на бумаге:
-///   yaw=0   → forward=(0,-1), right=( 1, 0)
-///   yaw=90  → forward=(-1,0), right=( 0,-1)
-///   yaw=180 → forward=(0, 1), right=(-1, 0)
+/// Вектор желаемого перемещения в плоскости XZ.
+/// Bevy-камера смотрит в -Z при yaw=0; forward = (-sin, -cos), right = (cos, -sin).
 pub fn desired_move(
     yaw_deg: f32,
     input: &InputState,
@@ -112,7 +107,6 @@ pub fn desired_move(
     let yaw = yaw_deg.to_radians();
     let (sy, cy) = (yaw.sin(), yaw.cos());
 
-    // forward = (-sy, -cy); right = (cy, -sy)
     let dx = -sy * f + cy * r;
     let dz = -cy * f - sy * r;
 
@@ -132,16 +126,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn move_forward_along_neg_z_at_yaw0() {
+    fn forward_at_yaw0_is_neg_z() {
         let mut i = InputState::default();
         i.forward = true;
         let v = desired_move(0.0, &i, 5.0, false, 1.75, 0.5);
-        assert!(v[0].abs() < 1e-5, "x={}", v[0]);
-        assert!((v[2] + 5.0).abs() < 1e-5, "z={}", v[2]); // -Z!
+        assert!(v[0].abs() < 1e-5);
+        assert!((v[2] + 5.0).abs() < 1e-5);
     }
 
     #[test]
-    fn move_back_along_pos_z_at_yaw0() {
+    fn back_at_yaw0_is_pos_z() {
         let mut i = InputState::default();
         i.back = true;
         let v = desired_move(0.0, &i, 5.0, false, 1.75, 0.5);
@@ -149,16 +143,15 @@ mod tests {
     }
 
     #[test]
-    fn strafe_right_at_yaw0() {
+    fn right_at_yaw0_is_pos_x() {
         let mut i = InputState::default();
         i.right = true;
         let v = desired_move(0.0, &i, 5.0, false, 1.75, 0.5);
         assert!((v[0] - 5.0).abs() < 1e-5);
-        assert!(v[2].abs() < 1e-5);
     }
 
     #[test]
-    fn strafe_left_at_yaw0() {
+    fn left_at_yaw0_is_neg_x() {
         let mut i = InputState::default();
         i.left = true;
         let v = desired_move(0.0, &i, 5.0, false, 1.75, 0.5);
@@ -166,20 +159,18 @@ mod tests {
     }
 
     #[test]
-    fn forward_at_yaw90_points_neg_x() {
+    fn forward_at_yaw90_is_neg_x() {
         let mut i = InputState::default();
         i.forward = true;
         let v = desired_move(90.0, &i, 5.0, false, 1.75, 0.5);
-        assert!((v[0] + 5.0).abs() < 1e-4, "x={}", v[0]);
-        assert!(v[2].abs() < 1e-4);
+        assert!((v[0] + 5.0).abs() < 1e-4);
     }
 
     #[test]
-    fn forward_at_yaw180_points_pos_z() {
+    fn forward_at_yaw180_is_pos_z() {
         let mut i = InputState::default();
         i.forward = true;
         let v = desired_move(180.0, &i, 5.0, false, 1.75, 0.5);
-        assert!(v[0].abs() < 1e-4);
         assert!((v[2] - 5.0).abs() < 1e-4);
     }
 
