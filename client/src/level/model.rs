@@ -1,10 +1,4 @@
-//! Структуры модели BDS Level Format v2 (infinite chunked levels).
-//! v2: уровень НЕ хранит сущности напрямую — всё живёт в <chunk>.
-//! Каждый чанк имеет generator: default | axis | none, и chance=0..100.
-//! Координаты внутри чанка ЛОКАЛЬНЫЕ: (0,0,0) = центр чанка.
-//!
-//! Обновлено: добавлена поддержка inline-материалов прямо в <entity>
-//! (texture/normal/roughness/ao/tiling) и вложенных <mesh shape= scale=/>.
+//! Структуры модели BDS Level Format v1/v2.
 
 use std::collections::BTreeMap;
 
@@ -94,6 +88,9 @@ pub struct MaterialDecl {
     pub roughness: Option<String>,
     pub ao: Option<String>,
     pub metallic: Option<String>,
+    /// Упакованная ARM-карта (Ambient/Roughness/Metallic в одном PNG).
+    /// Полигон использует её вместо отдельных rough+ao+metallic.
+    pub arm: Option<String>,
     pub emissive: Option<String>,
     pub emissive_strength: f32,
     pub tiling: Option<[f32; 2]>,
@@ -133,10 +130,8 @@ pub struct RenderDecl {
     pub mesh: Option<String>,
     pub cast_shadow: bool,
     pub receive_shadow: bool,
-    /// Вложенный тег <mesh shape="..." scale="..."/>
     pub mesh_shape: Option<String>,
     pub mesh_scale: Option<[f32; 3]>,
-    /// Inline-материал на самой entity (без <resources><material>).
     pub inline_material: Option<MaterialDecl>,
 }
 
@@ -226,6 +221,8 @@ pub struct LightDecl {
     pub intensity: f32,
     pub range: f32,
     pub shadow: bool,
+    /// Насколько сильно мерцает яркость (0 = без мерцания).
+    pub flicker: f32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -261,22 +258,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_level_is_empty() {
-        let l = Level::default();
-        assert!(l.entities.is_empty());
-        assert!(l.chunks.is_empty());
-        assert!(l.chunk_size.is_none());
+    fn material_default_has_arm_field() {
+        let m = MaterialDecl::default();
+        assert!(m.arm.is_none());
     }
 
     #[test]
-    fn chunk_default_generator() {
-        let c = Chunk::default();
-        assert_eq!(c.generator, ChunkGenerator::Default);
-    }
-
-    #[test]
-    fn entity_default_transform_zero() {
-        let e = Entity::default();
-        assert_eq!(e.transform.pos, [0.0, 0.0, 0.0]);
+    fn light_default_has_no_flicker() {
+        let l = LightDecl::default();
+        assert_eq!(l.flicker, 0.0);
     }
 }

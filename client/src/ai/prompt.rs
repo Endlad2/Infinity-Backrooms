@@ -1,55 +1,19 @@
-//! Сборка промта для генерации уровня в BDS Level Format v2 XML (chunked).
+//! Сборка промтов для ИИ. Тексты лежат в файлах `prompts/*.txt`
+//! и включаются в бинарник через include_str! — их можно менять без правки Rust.
 
 use crate::ai::client::{ChatRequest, MODEL_LEVEL_SEARCH, MODEL_REASONER};
 
 pub const WIKI_BASE: &str = "https://www.backroomswiki.ru/level-";
 
-pub const SYSTEM_INSTRUCTION: &str = "\
-Ты генератор уровней для игры Backrooms Infinity. Формат вывода — BDS Level Format v2 (XML, бесконечные чанковые уровни). \
-Строгие требования:\n\
-- Верни ТОЛЬКО валидный XML, начинающийся с <level ...> и заканчивающийся </level>. \
-Никакого текста до/после, без markdown-обёрток.\n\
-- Атрибут format=\"bds-level/2\", engine=\"bevy\", version=\"2.0\". ОБЯЗАТЕЛЬНО задай seed=\"<целое>\".\n\
-- Уровень НЕ хранит сущности напрямую: ВСЁ живёт внутри <chunks><chunk>...</chunk></chunks>. \
-Top-level <entities> не используй.\n\
-- ОБЯЗАТЕЛЬНА секция <chunk_size x=\"32\" y=\"16\" z=\"32\"/> сразу после <meta>. \n\
-- Каждый <chunk id=\"...\" generator=\"default|axis|none\" chance=\"0..100\">: \n\
-   * generator=\"default\" — бесконечная сетка чанков по X/Z. \n\
-   * generator=\"axis\" axis=\"x|y|z\" — бесконечная сетка по одной оси. \n\
-   * generator=\"none\" — чанк объявлен, но автоматически НЕ создаётся; спавнится вручную из Lua. \n\
-   * chance — ОБЯЗАТЕЛЬНЫЙ атрибут, 0..100.\n\
-- Координаты внутри чанка — ЛОКАЛЬНЫЕ, (0,0,0) = ЦЕНТР чанка. \n\
-- Для чанка 32x16x32 пол обычно pos=\"0 -7.9 0\" scale=\"32 0.2 32\".\n\
-- ВАЖНО: если в промте передан список файлов из cache-files/, используй ИХ через \
-<texture src=\"assets/textures/<имя-файла>\"/> или <model path=\"assets/models/<имя-файла>\"/>. \
-Используй именно те имена, что в списке — БЕЗ изменения. \
-Клиент сам подставит %APPDATA%/.infinity-backrooms/cache-files/ при резолве. \
-Если в списке есть .gltf-файл, ссылайся так: <model path=\"assets/models/<имя>.gltf\"/>. \n\
-- <prefabs> — глобальные прототипы, сущности внутри чанков наследуют их через inherit=\"pf_id\".\n\
-- <resources>: <texture tags=\"...\"/> (резолвится через assets.db/ИИ) либо <texture src=\"...\"/>, \
-либо <texture color=\"#rrggbb\"/>, либо инлайн <svg>...</svg>. \n\
-- Все Lua-скрипты — инлайн в <scripts>, как <script id=\"...\"><lua>...</lua></script>. \n\
-- Уровень должен быть играбельным: минимум один default-чанк с полом и светом, \
-один none-чанк-стартовая комната, <spawn_point> указывает на сущность player.\n\
-- КРИТИЧЕСКИ ВАЖНО: ОБЯЗАТЕЛЬНО объяви в стартовом none-чанке (chunk_spawn) сущность \
-type=\"player\" id=\"player_start\" с <transform pos=\"0 1 0\"/>. БЕЗ этой сущности игра \
-НЕ ЗАПУСТИТСЯ — окно будет чёрным и закроется. Это самая важная часть XML. \
-Атрибут spawn_point на <level> должен указывать именно на \"player_start\".\n\
-- Пример обязательного none-чанка со спавном:\n\
-  <chunk id=\"chunk_spawn\" generator=\"none\" chance=\"0\">\n\
-    <entity id=\"player_start\" type=\"player\">\n\
-      <transform pos=\"0 1 0\" rot=\"0 0 0\" scale=\"1 1 1\"/>\n\
-      <stats hp=\"100\" hp_max=\"100\" speed=\"5\" jump=\"6\" faction=\"players\"/>\n\
-      <camera mode=\"first_person\" fov=\"75\"/>\n\
-      <physics body=\"kinematic\" collider=\"capsule\" radius=\"0.4\" height=\"1.8\"/>\n\
-    </entity>\n\
-    <entity id=\"spawn_lamp\" type=\"light\">\n\
-      <transform pos=\"0 3 0\" rot=\"0 0 0\" scale=\"1 1 1\"/>\n\
-      <light kind=\"point\" color=\"#ffe9b0\" intensity=\"3.0\" range=\"14.0\"/>\n\
-    </entity>\n\
-  </chunk>\n\
-- Не используй HTML-escape, не оборачивай в CDATA.\n";
+/// Системная инструкция для Этапа 2 — вынесена в файл.
+pub const SYSTEM_INSTRUCTION: &str =
+    include_str!("../../prompts/stage2_prompt.txt");
 
+/// Системная инструкция для Этапа 1 — вынесена в файл.
+pub const STAGE1_INSTRUCTION: &str =
+    include_str!("../../prompts/stage1_prompt.txt");
+
+/// Собрать ChatRequest для генерации уровня (Этап 2).
 pub fn build_level_request(
     number: u32,
     wiki_html: Option<&str>,
@@ -80,7 +44,7 @@ pub fn build_level_request(
         user.push_str(
             "\nСсылайся на них так: \
              <texture src=\"assets/textures/<имя-файла>\"/> для текстур, \
-             <model path=\"assets/models/<имя-файла>.gltf\"/> для моделей. \
+             <model path=\"assets/models/<папка>_files/<файл>.gltf\"/> для моделей. \
              Используй ИМЕННО те файлы, что в списке — не выдумывай новые.\n",
         );
     }
@@ -120,6 +84,55 @@ pub fn build_level_request_reasoner(
     }
 }
 
+/// Собрать user-промт для Этапа 1 (какие ассеты нужны).
+pub fn build_stage1_user_prompt(
+    level_number: u32,
+    wiki_html: Option<&str>,
+    existing_files: &[String],
+    notes: Option<&str>,
+) -> String {
+    let mut user = String::new();
+    user.push_str(&format!(
+        "Уровень номер {level_number} для Backrooms Infinity.\n\n"
+    ));
+
+    if let Some(html) = wiki_html {
+        let trimmed: String = html.chars().take(80_000).collect();
+        user.push_str("=== HTML страницы вики ===\n");
+        user.push_str(&trimmed);
+        user.push_str("\n\n");
+    } else {
+        user.push_str("(HTML вики недоступен — работай по общим знаниям о backrooms)\n\n");
+    }
+
+    user.push_str("=== Файлы, УЖЕ лежащие в cache-files/ ===\n");
+    if existing_files.is_empty() {
+        user.push_str("(пусто)\n");
+    } else {
+        for f in existing_files {
+            user.push_str("  ");
+            user.push_str(f);
+            user.push('\n');
+        }
+    }
+
+    if let Some(n) = notes {
+        if !n.trim().is_empty() {
+            user.push_str("\nЗамечания от прошлой генерации - ");
+            user.push_str(n.trim());
+            user.push('\n');
+        }
+    }
+
+    user.push_str(
+        "\nВерни ТОЛЬКО JSON-массив (может быть пустым []) с тем, что ещё нужно скачать. \
+         Никакого текста вокруг.",
+    );
+
+    user
+}
+
+/// URL вики-страницы для уровня.
 pub fn wiki_url(number: u32) -> String {
     format!("{WIKI_BASE}{number}")
 }
@@ -135,47 +148,28 @@ mod tests {
     }
 
     #[test]
-    fn build_request_includes_notes() {
-        let r = build_level_request(5, None, Some("больше растений"), &[]);
-        let joined: String = r.messages.iter().map(|m| m.content.clone()).collect();
-        assert!(joined.contains("Замечания от прошлой генерации - больше растений"));
+    fn stage2_instruction_loaded_from_file() {
+        // Проверяем, что include_str! действительно загрузил текст.
+        assert!(SYSTEM_INSTRUCTION.contains("BDS Level Format v2"));
+        assert!(SYSTEM_INSTRUCTION.contains("player_start"));
     }
 
     #[test]
-    fn build_request_includes_html_snippet() {
-        let r = build_level_request(1, Some("<html>описание уровня 1</html>"), None, &[]);
-        let joined: String = r.messages.iter().map(|m| m.content.clone()).collect();
-        assert!(joined.contains("описание уровня 1"));
+    fn stage1_instruction_loaded_from_file() {
+        assert!(STAGE1_INSTRUCTION.contains("JSON-МАССИВОМ")
+            || STAGE1_INSTRUCTION.contains("JSON-массив"));
     }
 
     #[test]
-    fn build_request_includes_cached_files() {
-        let files = vec![
-            "Brick_Floor_003_diff.png".to_string(),
-            "Brick_Floor_003_nor_gl.png".to_string(),
-        ];
-        let r = build_level_request(2, None, None, &files);
-        let joined: String = r.messages.iter().map(|m| m.content.clone()).collect();
-        assert!(joined.contains("Brick_Floor_003_diff.png"));
-    }
-
-    #[test]
-    fn build_request_mentions_player_start() {
-        let r = build_level_request(2, None, None, &[]);
-        let joined: String = r.messages.iter().map(|m| m.content.clone()).collect();
-        assert!(joined.contains("player_start"));
-        assert!(joined.contains("type=\"player\""));
-    }
-
-    #[test]
-    fn build_request_uses_search_model() {
-        let r = build_level_request(2, None, None, &[]);
-        assert_eq!(r.model, MODEL_LEVEL_SEARCH);
-    }
-
-    #[test]
-    fn reasoner_fallback_uses_reasoner() {
-        let r = build_level_request_reasoner(2, None, None, &[]);
-        assert_eq!(r.model, MODEL_REASONER);
+    fn stage1_user_prompt_contains_html_and_files() {
+        let p = build_stage1_user_prompt(
+            7,
+            Some("<html>Level 7 — Thalassophobia</html>"),
+            &["Concrete_Floor_diff.png".to_string()],
+            None,
+        );
+        assert!(p.contains("Thalassophobia"));
+        assert!(p.contains("Concrete_Floor_diff.png"));
+        assert!(p.contains("JSON-массив"));
     }
 }

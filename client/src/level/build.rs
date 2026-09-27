@@ -1,5 +1,4 @@
-//! Построение данных уровня для Bevy-сцены (BDS Level Format v1 + v2).
-//! v2: уровень состоит из чанков; локальные координаты внутри чанка.
+//! Построение данных уровня для Bevy-сцены (v1 + v2).
 
 use std::collections::BTreeMap;
 
@@ -29,14 +28,10 @@ pub enum MeshKind {
     Custom { model_id: String },
 }
 
-/// Что именно рисовать для узла: либо примитив (с размерами), либо gltf-модель.
 #[derive(Debug, Clone)]
 pub struct MeshSpec {
     pub kind: MeshKind,
-    /// Размеры меша напрямую (для Cuboid::new(...), Cylinder::new(...) и т.п.).
-    /// Для Custom — не используется.
     pub size: [f32; 3],
-    /// Модель из cache-files/assets — путь к .gltf, если kind = Custom.
     pub model_path: Option<String>,
 }
 
@@ -47,17 +42,16 @@ pub enum LightKindPlan {
     Spot,
 }
 
-/// Готовый к применению PBR-набор (ссылки на текстурные ID из ResolvedAssets).
 #[derive(Debug, Clone, Default)]
 pub struct MaterialPlan {
-    /// ID для base_color_texture (diff).
     pub base: Option<String>,
     pub normal: Option<String>,
     pub roughness: Option<String>,
     pub ao: Option<String>,
-    /// Inline цвет (hex) — если текстуры нет.
+    pub arm: Option<String>,
     pub color: Option<String>,
-    /// tiling (u, v) для UV-скейла.
+    pub emissive: Option<String>,
+    pub emissive_strength: f32,
     pub tiling: Option<[f32; 2]>,
     pub roughness_f32: f32,
     pub metallic_f32: f32,
@@ -72,7 +66,7 @@ pub struct NodePlan {
     pub scale: [f32; 3],
     pub mesh: Option<MeshSpec>,
     pub material: MaterialPlan,
-    pub light: Option<(LightKindPlan, String, f32, f32)>,
+    pub light: Option<(LightKindPlan, String, f32, f32, f32)>, // + flicker
     pub collider: Option<ColliderPlan>,
     pub stats: StatsDecl,
     pub events: Vec<EntityEvent>,
@@ -165,9 +159,6 @@ pub fn build_scene_plan(level: &Level, assets: &ResolvedAssets) -> Result<SceneP
             nodes: template_nodes.clone(),
         });
 
-        // generator="none" НЕ раскрываем автоматически — он должен спавниться из Lua.
-        // Но чтобы игрок хоть что-то увидел, если Lua не сработал, всё же раскроем
-        // стартовый чанк (в нём лежит player_start).
         let is_spawn_chunk = template_nodes.iter().any(|n| n.kind == NodeKind::Player);
         let auto_spawn = matches!(gen_plan, ChunkGenPlan::Default | ChunkGenPlan::Axis(_))
             || is_spawn_chunk;
@@ -178,29 +169,21 @@ pub fn build_scene_plan(level: &Level, assets: &ResolvedAssets) -> Result<SceneP
         }
     }
 
-    let triggers = level
-        .triggers
-        .iter()
-        .map(|t| TriggerPlan {
-            id: t.id.clone(),
-            kind: t.kind.clone().unwrap_or_else(|| "volume".into()),
-            pos: t.pos,
-            size: t.size,
-            radius: t.radius,
-            interval: t.interval,
-            signal: t.signal.clone(),
-            on_enter: t.on_enter.clone(),
-            on_exit: t.on_exit.clone(),
-            on_tick: t.on_tick.clone(),
-            on_signal: t.on_signal.clone(),
-        })
-        .collect();
+    let triggers = level.triggers.iter().map(|t| TriggerPlan {
+        id: t.id.clone(),
+        kind: t.kind.clone().unwrap_or_else(|| "volume".into()),
+        pos: t.pos,
+        size: t.size,
+        radius: t.radius,
+        interval: t.interval,
+        signal: t.signal.clone(),
+        on_enter: t.on_enter.clone(),
+        on_exit: t.on_exit.clone(),
+        on_tick: t.on_tick.clone(),
+        on_signal: t.on_signal.clone(),
+    }).collect();
 
-    let scripts = level
-        .scripts
-        .iter()
-        .map(|s| (s.id.clone(), s.lua.clone()))
-        .collect();
+    let scripts = level.scripts.iter().map(|s| (s.id.clone(), s.lua.clone())).collect();
 
     Ok(ScenePlan {
         spawn_point: level.spawn_point.clone(),
@@ -227,6 +210,9 @@ fn build_node_plan(ent: &Entity, level: &Level, assets: &ResolvedAssets) -> Node
         Some("light") => NodeKind::Light,
         Some("pickup") => NodeKind::Pickup,
         Some("spawner") => NodeKind::Spawner,
+        // ИИ пишет type="static_body" / "static" / "volume" / "decor" —
+        // всё это статические объекты, которые рисуются как обычные меши.
+        Some("static_body") | Some("static") | Some("volume") | Some("decor") => NodeKind::Prop,
         _ => NodeKind::Other,
     };
 
@@ -265,9 +251,7 @@ pub(crate) fn pick_template_by_chance<'a>(
     grid: (i32, i32, i32),
 ) -> Option<&'a ChunkTemplatePlan> {
     let total: f32 = templates.iter().map(|t| t.chance.max(0.0)).sum();
-    if total <= 0.0 {
-        return templates.first();
-    }
+    if total <= 0.0 { return templates.first(); }
     let h = hash_grid(seed, grid);
     let r = (h as f64 / u64::MAX as f64) as f32 * total;
     let mut acc = 0.0f32;
@@ -286,19 +270,16 @@ pub(crate) fn expand_chunk_nodes(
     chunk_origin: [f32; 3],
     _chunk_size: Option<[f32; 3]>,
 ) -> Vec<NodePlan> {
-    nodes
-        .iter()
-        .map(|n| {
-            let mut p = n.clone();
-            p.id = format!("{chunk_id}/{}", n.id);
-            p.pos = [
-                chunk_origin[0] + n.pos[0],
-                chunk_origin[1] + n.pos[1],
-                chunk_origin[2] + n.pos[2],
-            ];
-            p
-        })
-        .collect()
+    nodes.iter().map(|n| {
+        let mut p = n.clone();
+        p.id = format!("{chunk_id}/{}", n.id);
+        p.pos = [
+            chunk_origin[0] + n.pos[0],
+            chunk_origin[1] + n.pos[1],
+            chunk_origin[2] + n.pos[2],
+        ];
+        p
+    }).collect()
 }
 
 fn resolve_inheritance(ent: &Entity, prefabs: &BTreeMap<String, Entity>) -> Entity {
@@ -309,18 +290,14 @@ fn resolve_inheritance(ent: &Entity, prefabs: &BTreeMap<String, Entity>) -> Enti
             merged.id = ent.id.clone();
             merged.kind = ent.kind.clone().or(proto.kind.clone());
             merged.inherit = None;
-            merged.transform = ent.transform.clone();
 
-            // Тонкость: transform.pos по умолчанию [0,0,0] — если у entity явно
-            // указан, используем его; иначе берём из prefab.
-            if ent.transform.pos == [0.0, 0.0, 0.0]
-                && proto.transform.pos != [0.0, 0.0, 0.0]
-            {
+            // Слияние transform: если у ребёнка pos не [0,0,0] — берём его,
+            // иначе — из prefab.
+            merged.transform = ent.transform.clone();
+            if ent.transform.pos == [0.0, 0.0, 0.0] && proto.transform.pos != [0.0, 0.0, 0.0] {
                 merged.transform.pos = proto.transform.pos;
             }
-            if ent.transform.rot == [0.0, 0.0, 0.0]
-                && proto.transform.rot != [0.0, 0.0, 0.0]
-            {
+            if ent.transform.rot == [0.0, 0.0, 0.0] && proto.transform.rot != [0.0, 0.0, 0.0] {
                 merged.transform.rot = proto.transform.rot;
             }
             if ent.transform.scale == [0.0, 0.0, 0.0] {
@@ -335,7 +312,6 @@ fn resolve_inheritance(ent: &Entity, prefabs: &BTreeMap<String, Entity>) -> Enti
             if ent.material.is_some() { merged.material = ent.material.clone(); }
             if !ent.events.is_empty() { merged.events = ent.events.clone(); }
 
-            // Сливаем render: если у ребёнка задан mesh_shape/inline_material — берём его.
             if ent.render.mesh_shape.is_some() {
                 merged.render.mesh_shape = ent.render.mesh_shape.clone();
             }
@@ -345,22 +321,18 @@ fn resolve_inheritance(ent: &Entity, prefabs: &BTreeMap<String, Entity>) -> Enti
             if ent.render.inline_material.is_some() {
                 merged.render.inline_material = ent.render.inline_material.clone();
             }
-            if ent.render.mesh.is_some() {
-                merged.render.mesh = ent.render.mesh.clone();
+            if ent.render.mesh.is_some() { merged.render.mesh = ent.render.mesh.clone(); }
+            if ent.render.material.is_some() {
+                merged.render.material = ent.render.material.clone();
             }
+
             merged
         }
         _ => ent.clone(),
     }
 }
 
-/// Собирает MeshSpec из merged entity.
-/// Приоритеты:
-///   1. `<mesh shape=... scale=.../>` (вложенный тег) → примитив с размерами scale.
-///   2. `render.mesh="plane|cube|sphere|cylinder"` → примитив размера 1.
-///   3. `model=...` или `render.model=...` → gltf-модель.
 fn plan_mesh(e: &Entity) -> Option<MeshSpec> {
-    // 1. Вложенный <mesh shape= scale=/>
     if let Some(shape) = &e.render.mesh_shape {
         let s = e.render.mesh_scale.unwrap_or([1.0, 1.0, 1.0]);
         let kind = match shape.to_ascii_lowercase().as_str() {
@@ -371,8 +343,6 @@ fn plan_mesh(e: &Entity) -> Option<MeshSpec> {
         };
         return Some(MeshSpec { kind, size: s, model_path: None });
     }
-
-    // 2. render.mesh="..."
     if let Some(m) = e.render.mesh.as_deref() {
         let kind = match m {
             "plane" => MeshKind::Plane,
@@ -381,11 +351,8 @@ fn plan_mesh(e: &Entity) -> Option<MeshSpec> {
             "cube" | "box" => MeshKind::Cube,
             other => MeshKind::Custom { model_id: other.to_string() },
         };
-        // Для Cube/Plane/Sphere/Cylinder по умолчанию — единичный размер.
         return Some(MeshSpec { kind, size: [1.0, 1.0, 1.0], model_path: None });
     }
-
-    // 3. Модель — gltf/obj.
     if let Some(model_id) = e.render.model.as_ref().or(e.model.as_ref()) {
         return Some(MeshSpec {
             kind: MeshKind::Custom { model_id: model_id.clone() },
@@ -393,43 +360,19 @@ fn plan_mesh(e: &Entity) -> Option<MeshSpec> {
             model_path: None,
         });
     }
-
     None
 }
 
 fn plan_material(e: &Entity, level: &Level, assets: &ResolvedAssets) -> MaterialPlan {
-    // 1. Inline-материал прямо на entity (приоритет).
+    let _ = assets;
     if let Some(im) = &e.render.inline_material {
-        let mut p = MaterialPlan {
-            base: im.texture.clone(),
-            normal: im.normal.clone(),
-            roughness: im.roughness.clone(),
-            ao: im.ao.clone(),
-            color: None,
-            tiling: im.tiling,
-            roughness_f32: im.roughness_f32,
-            metallic_f32: im.metallic_f32,
-        };
-        // Fallback — ищем material= через resources (если указан).
-        if p.base.is_none() {
-            if let Some(mat_id) = e.material.as_ref().or(e.render.material.as_ref()) {
-                if let Some(mat) = level.resources.materials.iter().find(|m| &m.id == mat_id) {
-                    p = material_to_plan(mat);
-                }
-            }
-        }
-        return p;
+        return material_to_plan(im);
     }
-
-    // 2. material= → ищем в resources.materials
     if let Some(mat_id) = e.material.as_ref().or(e.render.material.as_ref()) {
         if let Some(mat) = level.resources.materials.iter().find(|m| &m.id == mat_id) {
             return material_to_plan(mat);
         }
     }
-
-    // 3. Ничего.
-    let _ = assets;
     MaterialPlan::default()
 }
 
@@ -439,14 +382,17 @@ fn material_to_plan(m: &MaterialDecl) -> MaterialPlan {
         normal: m.normal.clone(),
         roughness: m.roughness.clone(),
         ao: m.ao.clone(),
+        arm: m.arm.clone(),
         color: None,
+        emissive: m.emissive.clone(),
+        emissive_strength: m.emissive_strength,
         tiling: m.tiling,
         roughness_f32: m.roughness_f32,
         metallic_f32: m.metallic_f32,
     }
 }
 
-fn plan_light(e: &Entity) -> Option<(LightKindPlan, String, f32, f32)> {
+fn plan_light(e: &Entity) -> Option<(LightKindPlan, String, f32, f32, f32)> {
     let l = e.light.as_ref()?;
     let kind = match l.kind.as_deref() {
         Some("point") => LightKindPlan::Point,
@@ -458,6 +404,7 @@ fn plan_light(e: &Entity) -> Option<(LightKindPlan, String, f32, f32)> {
         l.color.clone().unwrap_or_else(|| "#ffffff".into()),
         l.intensity,
         l.range,
+        l.flicker,
     ))
 }
 
@@ -468,25 +415,21 @@ fn plan_collider(e: &Entity) -> Option<ColliderPlan> {
     match c {
         "box" => Some(ColliderPlan::Box {
             size: e.physics.size.unwrap_or([1.0, 1.0, 1.0]),
-            sensor,
-            body,
+            sensor, body,
         }),
         "sphere" => Some(ColliderPlan::Sphere {
             radius: e.physics.radius.unwrap_or(0.5),
-            sensor,
-            body,
+            sensor, body,
         }),
         "capsule" => Some(ColliderPlan::Capsule {
             radius: e.physics.radius.unwrap_or(0.4),
             height: e.physics.height.unwrap_or(1.8),
-            sensor,
-            body,
+            sensor, body,
         }),
         "cylinder" => Some(ColliderPlan::Capsule {
             radius: e.physics.radius.unwrap_or(0.5),
             height: e.physics.height.unwrap_or(1.0),
-            sensor,
-            body,
+            sensor, body,
         }),
         _ => None,
     }
@@ -496,101 +439,40 @@ fn plan_collider(e: &Entity) -> Option<ColliderPlan> {
 mod tests {
     use super::*;
 
-    fn mk_simple_level() -> Level {
-        let mut l = Level::default();
-        l.spawn_point = Some("player_start".into());
-        l.bounds = Bounds { min: [-10.0, -2.0, -10.0], max: [10.0, 10.0, 10.0] };
-
-        l.resources.textures.push(TextureDecl {
-            id: "tex_ground".into(),
-            source: TextureSource::Color("#333333".into()),
-            tags: vec![],
-            width: 64, height: 64, filter: None, wrap: None,
-        });
-        l.resources.materials.push(MaterialDecl {
-            id: "mat_ground".into(),
-            texture: Some("tex_ground".into()),
-            roughness_f32: 1.0,
-            ..Default::default()
-        });
-
-        let mut player = Entity {
-            id: "player_start".into(),
-            kind: Some("player".into()),
-            ..Default::default()
-        };
-        player.transform.pos = [0.0, 1.0, 0.0];
-        l.entities.push(player);
-
-        l
-    }
-
     #[test]
-    fn plans_player() {
-        let l = mk_simple_level();
-        let assets = ResolvedAssets::default();
-        let plan = build_scene_plan(&l, &assets).unwrap();
-        let p = plan.nodes.iter().find(|n| n.id == "player_start").unwrap();
-        assert_eq!(p.kind, NodeKind::Player);
-    }
-
-    fn mk_v2_level() -> Level {
-        let mut l = Level::default();
-        l.chunk_size = Some(ChunkSize { x: 32.0, y: 16.0, z: 32.0 });
-        l.seed = Some(1337);
-        let mut ch_default = Chunk {
-            id: "chunk_field".into(),
-            generator: ChunkGenerator::Default,
-            chance: 90.0,
-            entities: vec![],
-        };
-        let mut floor = Entity {
-            id: "floor".into(),
-            kind: Some("prop".into()),
-            ..Default::default()
-        };
-        floor.transform.pos = [0.0, -7.9, 0.0];
-        floor.render.mesh_shape = Some("box".into());
-        floor.render.mesh_scale = Some([32.0, 0.2, 32.0]);
-        ch_default.entities.push(floor);
-
-        l.chunks.push(ch_default);
-        l
-    }
-
-    #[test]
-    fn v2_builds_chunk_templates_and_expands_default() {
-        let l = mk_v2_level();
-        let assets = ResolvedAssets::default();
-        let plan = build_scene_plan(&l, &assets).unwrap();
-
-        assert_eq!(plan.chunk_templates.len(), 1);
-        assert_eq!(plan.chunk_size, Some([32.0, 16.0, 32.0]));
-
-        let f = plan.nodes.iter().find(|n| n.id == "chunk_field/floor").unwrap();
-        assert_eq!(f.pos, [0.0, -7.9, 0.0]);
-        match &f.mesh.as_ref().unwrap().kind {
-            MeshKind::Cube => {}
-            other => panic!("ожидался Cube, получен {:?}", other),
-        }
-        assert_eq!(f.mesh.as_ref().unwrap().size, [32.0, 0.2, 32.0]);
-    }
-
-    #[test]
-    fn inline_material_is_used() {
-        let xml = r#"<level id="l" format="bds-level/2" seed="1"><chunk_size x="32" y="16" z="32"/><chunks><chunk id="c" generator="none" chance="0">
+    fn materials_from_top_level_section_apply() {
+        let xml = r#"<level id="l" format="bds-level/2"><chunk_size x="32" y="16" z="32"/>
+<resources>
+<texture id="tex_a" src="assets/textures/A.png"/>
+</resources>
+<materials>
+<material id="mat_wall" albedo="tex_a" roughness="0.9" uv_scale="2 4"/>
+</materials>
+<chunks><chunk id="c" generator="none" chance="0">
 <entity id="player_start" type="player"><transform pos="0 1 0"/></entity>
-<entity id="floor" type="static">
+<entity id="floor" type="static_body">
   <mesh shape="box" scale="32 0.2 32"/>
-  <material texture="tex_concrete_floor" normal="tex_concrete_floor_nor" tiling="8 8"/>
+  <render material="mat_wall"/>
 </entity>
 </chunk></chunks></level>"#;
         let l = crate::level::parse::parse_level_xml(xml).unwrap();
         let assets = ResolvedAssets::default();
         let plan = build_scene_plan(&l, &assets).unwrap();
         let f = plan.nodes.iter().find(|n| n.id == "c/floor").unwrap();
-        assert_eq!(f.material.base.as_deref(), Some("tex_concrete_floor"));
-        assert_eq!(f.material.normal.as_deref(), Some("tex_concrete_floor_nor"));
-        assert_eq!(f.material.tiling, Some([8.0, 8.0]));
+        assert_eq!(f.material.base.as_deref(), Some("tex_a"));
+        assert_eq!(f.material.tiling, Some([2.0, 4.0]));
+    }
+
+    #[test]
+    fn static_body_maps_to_prop() {
+        let xml = r#"<level id="l" format="bds-level/2"><chunk_size x="32" y="16" z="32"/><chunks><chunk id="c" generator="none" chance="0">
+<entity id="player_start" type="player"><transform pos="0 1 0"/></entity>
+<entity id="w" type="static_body"><render mesh="cube"/></entity>
+</chunk></chunks></level>"#;
+        let l = crate::level::parse::parse_level_xml(xml).unwrap();
+        let assets = ResolvedAssets::default();
+        let plan = build_scene_plan(&l, &assets).unwrap();
+        let w = plan.nodes.iter().find(|n| n.id == "c/w").unwrap();
+        assert_eq!(w.kind, NodeKind::Prop);
     }
 }

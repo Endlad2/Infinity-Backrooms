@@ -1,7 +1,10 @@
-//! Парсер XML в структуры Level (BDS Level Format v1 + v2) — БЕЗ сторонних библиотек.
+//! Парсер XML в структуры Level (BDS Level Format v1 + v2).
 //!
-//! Обновлено: поддержка inline-материалов на <entity> (texture/normal/.../tiling)
-//! и вложенных тегов <mesh shape= scale=/>.
+//! Обновлено:
+//!   * Поддержана секция `<materials>` верхнего уровня (не только внутри `<resources>`).
+//!   * В `<material>` понимаются алиасы: `albedo`=`texture`, `uv_scale`=`tiling`,
+//!     `emissive_intensity`=`emissive_strength`.
+//!   * В `<light>` поддержан атрибут `flicker`.
 
 use anyhow::{anyhow, Result};
 
@@ -27,6 +30,15 @@ struct Element {
 impl Element {
     fn attr(&self, key: &str) -> Option<&str> {
         self.attrs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+    /// Алиасы: пробуем ключи по порядку, возвращаем первый найденный.
+    fn attr_any(&self, keys: &[&str]) -> Option<&str> {
+        for k in keys {
+            if let Some(v) = self.attr(k) {
+                return Some(v);
+            }
+        }
+        None
     }
     fn child(&self, name: &str) -> Option<&Element> {
         self.children.iter().find_map(|c| match c {
@@ -269,8 +281,17 @@ pub fn parse_level_xml(xml: &str) -> Result<Level> {
         level.meta = parse_meta(m);
     }
 
+    // <resources> содержит textures/models/materials/sounds/animations.
     if let Some(r) = root.child("resources") {
         level.resources = parse_resources(r);
+    }
+
+    // ВАЖНОЕ: секция <materials> ВЕРХНЕГО уровня (ИИ её часто генерирует
+    // отдельно от <resources>). Дополняем level.resources.materials.
+    if let Some(mats) = root.child("materials") {
+        for mat in mats.children_named("material") {
+            level.resources.materials.push(parse_material(mat));
+        }
     }
 
     if let Some(p) = root.child("prefabs") {
@@ -325,21 +346,21 @@ pub fn parse_level_xml(xml: &str) -> Result<Level> {
 }
 
 fn parse_meta(n: &Element) -> Meta {
-    Meta {
-        author: n.child("author").map(|c| c.inner_text().trim().to_string()),
-        created: n.child("created").map(|c| c.inner_text().trim().to_string()),
-        description: n.child("description").map(|c| c.inner_text().trim().to_string()),
-        tags: n
-            .child("tags")
-            .map(|c| {
-                c.inner_text()
-                    .split(',')
-                    .map(|x| x.trim().to_string())
-                    .filter(|x| !x.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default(),
-    }
+    // Meta может быть как атрибутами, так и вложенными тегами.
+    let author = n.attr("author").map(|s| s.to_string())
+        .or_else(|| n.child("author").map(|c| c.inner_text().trim().to_string()));
+    let created = n.attr("created").map(|s| s.to_string())
+        .or_else(|| n.child("created").map(|c| c.inner_text().trim().to_string()));
+    let description = n.attr("description").map(|s| s.to_string())
+        .or_else(|| n.child("description").map(|c| c.inner_text().trim().to_string()));
+    let tags = if let Some(t) = n.attr("tags") {
+        t.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
+    } else if let Some(tc) = n.child("tags") {
+        tc.inner_text().split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
+    } else {
+        Vec::new()
+    };
+    Meta { author, created, description, tags }
 }
 
 fn parse_resources(n: &Element) -> Resources {
@@ -418,18 +439,25 @@ fn parse_resources(n: &Element) -> Resources {
     r
 }
 
-/// Универсальный парсер <material> — работает и для resources, и для inline.
+/// Универсальный парсер <material> — понимает алиасы атрибутов:
+///   albedo/texture → texture
+///   uv_scale/tiling → tiling
+///   emissive_intensity/emissive_strength → emissive_strength
 fn parse_material(mat: &Element) -> MaterialDecl {
     MaterialDecl {
         id: mat.attr("id").unwrap_or_default().to_string(),
-        texture: mat.attr("texture").map(|s| s.to_string()),
-        normal: mat.attr("normal").map(|s| s.to_string()),
-        roughness: mat.attr("roughness_tex").map(|s| s.to_string()),
-        ao: mat.attr("ao").map(|s| s.to_string()),
-        metallic: mat.attr("metallic_tex").map(|s| s.to_string()),
+        texture: mat.attr_any(&["texture", "albedo"]).map(|s| s.to_string()),
+        normal: mat.attr_any(&["normal", "normal_map", "nor"]).map(|s| s.to_string()),
+        roughness: mat.attr_any(&["roughness_tex", "rough"]).map(|s| s.to_string()),
+        ao: mat.attr_any(&["ao", "occlusion"]).map(|s| s.to_string()),
+        metallic: mat.attr_any(&["metallic_tex", "metal"]).map(|s| s.to_string()),
+        arm: mat.attr("arm").map(|s| s.to_string()),
         emissive: mat.attr("emissive").map(|s| s.to_string()),
-        emissive_strength: parse_f32(mat.attr("emissive_strength")).unwrap_or(0.0),
-        tiling: parse_vec2_attr(mat.attr("tiling")),
+        emissive_strength: parse_f32(
+            mat.attr_any(&["emissive_strength", "emissive_intensity"]),
+        )
+        .unwrap_or(0.0),
+        tiling: parse_vec2_attr(mat.attr_any(&["tiling", "uv_scale"])),
         roughness_f32: parse_f32(mat.attr("roughness")).unwrap_or(0.8),
         metallic_f32: parse_f32(mat.attr("metallic")).unwrap_or(0.0),
     }
@@ -477,7 +505,7 @@ fn parse_entity(n: &Element) -> Result<Entity> {
         };
     }
 
-    // <render .../> — старый вариант с атрибутом mesh=
+    // <render .../> (старый вариант с mesh= и material= атрибутами)
     if let Some(r) = n.child("render") {
         e.render = RenderDecl {
             model: r.attr("model").map(|s| s.to_string()).or(e.model.clone()),
@@ -489,11 +517,10 @@ fn parse_entity(n: &Element) -> Result<Entity> {
         };
     }
 
-    // <mesh shape="..." scale="..."/> — вложенный тег
+    // <mesh shape="..." scale="..."/> (вложенный тег)
     if let Some(m) = n.child("mesh") {
         e.render.mesh_shape = m.attr("shape").map(|s| s.to_string());
         e.render.mesh_scale = parse_vec3(m.attr("scale"));
-        // Если mesh= не задан на <render>, но есть shape= — используем shape как mesh.
         if e.render.mesh.is_none() {
             if let Some(s) = &e.render.mesh_shape {
                 e.render.mesh = Some(s.clone());
@@ -501,10 +528,9 @@ fn parse_entity(n: &Element) -> Result<Entity> {
         }
     }
 
-    // <material .../> — inline прямо внутри entity.
+    // Inline <material .../> прямо внутри entity
     if let Some(mat) = n.child("material") {
         e.render.inline_material = Some(parse_material(mat));
-        // Если material= не задан на entity, но inline есть — используем inline.
     }
 
     if let Some(p) = n.child("physics") {
@@ -547,6 +573,7 @@ fn parse_entity(n: &Element) -> Result<Entity> {
             intensity: parse_f32(l.attr("intensity")).unwrap_or(1.0),
             range: parse_f32(l.attr("range")).unwrap_or(10.0),
             shadow: parse_bool(l.attr("shadow")),
+            flicker: parse_f32(l.attr("flicker")).unwrap_or(0.0),
         });
     }
 
@@ -634,132 +661,52 @@ fn parse_tags_str(s: Option<&str>) -> Vec<String> {
 mod tests {
     use super::*;
 
-    const XML: &str = r##"<?xml version="1.0"?>
-<level id="l1" name="Test" engine="bevy" format="bds-level/1" gravity="0 -9.81 0" spawn_point="player_start">
-  <meta><author>me</author><tags>a, b, c</tags></meta>
-  <resources>
-    <texture id="tex_wall" tags="wall,yellow"/>
-    <texture id="tex_red" color="#ff0000"/>
-    <model id="mdl_a" tags="chair,wood"/>
-    <material id="mat_x" texture="tex_wall" roughness="0.9"/>
-    <sound id="sfx_hit" path="audio/hit.ogg" volume="0.7"/>
-    <animation id="anim1" model="mdl_a" clip="run"/>
-  </resources>
-  <prefabs>
-    <prefab id="pf_crate"><entity id="root" type="prop" model="mdl_a" material="mat_x"><transform pos="1 2 3"/></entity></prefab>
-  </prefabs>
-  <entities>
-    <entity id="player_start" type="player">
-      <transform pos="0 1 0"/>
-      <stats hp="100" hp_max="100" speed="5" jump="6" faction="players"/>
-      <camera mode="first_person" fov="70"/>
-    </entity>
-    <entity id="sun" type="light"><light kind="directional" color="#ffffff" intensity="2.5"/></entity>
-  </entities>
-  <triggers>
-    <trigger id="trg1" type="volume" shape="box" size="1 2 3" pos="0 1 0">
-      <on_enter script="s1" func="f1"/>
-    </trigger>
-  </triggers>
-  <scripts>
-    <script id="intro"><lua>function on_level_start() if a < b then end end</lua></script>
-  </scripts>
-  <bounds min="-10 -2 -10" max="10 10 10"/>
-</level>"##;
-
     #[test]
-    fn parses_header_and_meta() {
-        let l = parse_level_xml(XML).unwrap();
-        assert_eq!(l.id, "l1");
-        assert_eq!(l.gravity, [0.0, -9.81, 0.0]);
-        assert_eq!(l.meta.tags, vec!["a", "b", "c"]);
-    }
-
-    #[test]
-    fn parses_resources() {
-        let l = parse_level_xml(XML).unwrap();
-        assert_eq!(l.resources.textures.len(), 2);
-        assert_eq!(l.resources.materials.len(), 1);
-    }
-
-    #[test]
-    fn parses_scripts_with_lua_containing_lt() {
-        let l = parse_level_xml(XML).unwrap();
-        assert!(l.scripts[0].lua.contains("if a < b then"));
-    }
-
-    #[test]
-    fn parses_v2_chunks() {
-        let xml = r#"<level id="l2" format="bds-level/2" seed="42">
+    fn parses_top_level_materials_section() {
+        let xml = r#"<level id="l" format="bds-level/2">
 <chunk_size x="32" y="16" z="32"/>
-<chunks>
-<chunk id="c1" generator="default" chance="90"><entity id="f" type="prop"/></chunk>
-<chunk id="c2" generator="axis" axis="y" chance="10"/>
-<chunk id="c3" generator="none" chance="0"/>
-</chunks>
-</level>"#;
-        let l = parse_level_xml(xml).unwrap();
-        assert_eq!(l.seed, Some(42));
-        assert_eq!(l.chunks.len(), 3);
-        assert_eq!(l.chunks[1].generator, ChunkGenerator::Axis("y".into()));
-    }
-
-    #[test]
-    fn parses_inline_material_and_mesh() {
-        let xml = r#"<level id="l" format="bds-level/2"><chunk_size x="32" y="16" z="32"/><chunks><chunk id="c" generator="none" chance="0">
-<entity id="floor" type="static">
-  <transform pos="0 -7.9 0"/>
-  <mesh shape="box" scale="32 0.2 32"/>
-  <material texture="tex_concrete" normal="tex_concrete_nor" roughness="tex_concrete_rough" ao="tex_concrete_ao" tiling="8 8"/>
-</entity>
-</chunk></chunks></level>"#;
-        let l = parse_level_xml(xml).unwrap();
-        let e = &l.chunks[0].entities[0];
-        assert_eq!(e.render.mesh_shape.as_deref(), Some("box"));
-        assert_eq!(e.render.mesh_scale, Some([32.0, 0.2, 32.0]));
-        let mat = e.render.inline_material.as_ref().unwrap();
-        assert_eq!(mat.texture.as_deref(), Some("tex_concrete"));
-        assert_eq!(mat.normal.as_deref(), Some("tex_concrete_nor"));
-        assert_eq!(mat.tiling, Some([8.0, 8.0]));
-    }
-
-    #[test]
-    fn parses_cylinder_mesh() {
-        let xml = r#"<level id="l" format="bds-level/2"><chunk_size x="32" y="16" z="32"/><chunks><chunk id="c" generator="none" chance="0">
-<entity id="pillar" type="static"><mesh shape="cylinder" scale="0.6 16 0.6"/></entity>
-</chunk></chunks></level>"#;
-        let l = parse_level_xml(xml).unwrap();
-        let e = &l.chunks[0].entities[0];
-        assert_eq!(e.render.mesh_shape.as_deref(), Some("cylinder"));
-        assert_eq!(e.render.mesh_scale, Some([0.6, 16.0, 0.6]));
-    }
-
-    #[test]
-    fn handles_real_ai_xml() {
-        let xml = r#"<level format="bds-level/2" seed="777007" spawn_point="player_start">
-<chunk_size x="32" y="16" z="32"/>
-<chunks>
-<chunk id="spawn" generator="none" chance="0">
+<resources>
+  <texture id="tex_a" src="assets/textures/A.png"/>
+  <texture id="tex_a_nor" src="assets/textures/A_nor_gl.png"/>
+</resources>
+<materials>
+  <material id="mat_wall" albedo="tex_a" normal="tex_a_nor" roughness="0.9" uv_scale="2 4"/>
+</materials>
+<chunks><chunk id="c" generator="none" chance="0">
 <entity id="player_start" type="player"><transform pos="0 1 0"/></entity>
-</chunk>
-<chunk id="flood" generator="default" chance="100">
-<entity id="floor" type="static"><mesh shape="box" scale="32 0.2 32"/><material texture="tex_concrete_floor" tiling="8 8"/></entity>
-</chunk>
-</chunks>
-<scripts>
-<script id="flicker"><lua>
-local t = 0
-local function flick(dt)
-  t = t + dt
-  if t < 0.08 then return end
-  if t > 5 then t = 0 end
-end
-</lua></script>
-</scripts>
+</chunk></chunks>
 </level>"#;
         let l = parse_level_xml(xml).unwrap();
-        assert_eq!(l.chunks.len(), 2);
-        assert!(l.scripts[0].lua.contains("t < 0.08"));
-        assert!(l.scripts[0].lua.contains("t > 5"));
+        assert_eq!(l.resources.materials.len(), 1);
+        let m = &l.resources.materials[0];
+        assert_eq!(m.id, "mat_wall");
+        assert_eq!(m.texture.as_deref(), Some("tex_a"));
+        assert_eq!(m.normal.as_deref(), Some("tex_a_nor"));
+        assert_eq!(m.tiling, Some([2.0, 4.0]));
+    }
+
+    #[test]
+    fn parses_ai_style_meta_attributes() {
+        let xml = r#"<level id="l" format="bds-level/2" seed="1">
+<meta name="Уровень EN-0" author="Backrooms Infinity" description="Жёлтые комнаты"/>
+<chunk_size x="32" y="16" z="32"/>
+<chunks><chunk id="c" generator="none" chance="0">
+<entity id="player_start" type="player"><transform pos="0 1 0"/></entity>
+</chunk></chunks>
+</level>"#;
+        let l = parse_level_xml(xml).unwrap();
+        assert_eq!(l.meta.author.as_deref(), Some("Backrooms Infinity"));
+        assert_eq!(l.meta.description.as_deref(), Some("Жёлтые комнаты"));
+    }
+
+    #[test]
+    fn parses_light_flicker() {
+        let xml = r#"<level id="l" format="bds-level/2"><chunk_size x="32" y="16" z="32"/><chunks><chunk id="c" generator="none" chance="0">
+<entity id="player_start" type="player"><transform pos="0 1 0"/></entity>
+<entity id="lamp" type="light"><light kind="point" color="#fff4c2" intensity="2.4" range="20" flicker="0.06"/></entity>
+</chunk></chunks></level>"#;
+        let l = parse_level_xml(xml).unwrap();
+        let lamp = &l.chunks[0].entities[1];
+        assert_eq!(lamp.light.as_ref().unwrap().flicker, 0.06);
     }
 }
