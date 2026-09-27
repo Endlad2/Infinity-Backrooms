@@ -1,10 +1,10 @@
 //! Основной игровой модуль Bevy.
 //!
-//! Обновлено: НЕ грузим все PNG сразу. Декодируем текстуры ЛЕНИВО, только
-//! когда чанк реально спавнится и его меши ссылаются на материал.
-//! Плюс мягкий лимит на количество загруженных текстур: если превышен —
-//! самые старые Handle выгружаются (через drop) — но проще: грузим
-//! только те текстуры, что встречаются в заспавненных чанках, а не все 46.
+//! Обновлено: подключён NetContext (для мультиплеера), плюс ленивая
+//! загрузка текстур.
+
+pub mod chunk_registry;
+pub mod net_context;
 
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
@@ -13,6 +13,8 @@ use bevy::render::texture::Image;
 use crate::level::assets_bridge::ResolvedAssets;
 use crate::level::build::{ColliderPlan, LightKindPlan, MeshKind, NodeKind, ScenePlan};
 use crate::scripting::ScriptEngine;
+
+pub use net_context::{NetContext, NetRole};
 
 #[derive(Resource, Default)]
 pub struct ActiveScene {
@@ -48,7 +50,6 @@ pub struct SceneNodeId(pub String);
 #[derive(Component, Debug, Clone)]
 pub struct SceneTriggerId(pub String);
 
-/// Ресурс с разрешёнными ассетами уровня (PNG-байты, OBJ-текст).
 #[derive(Resource, Default)]
 pub struct ResolvedAssetsResource {
     pub textures: std::collections::BTreeMap<String, Vec<u8>>,
@@ -66,13 +67,11 @@ impl From<&ResolvedAssets> for ResolvedAssetsResource {
     }
 }
 
-/// Кэш загруженных GPU-текстур, чтобы не грузить одну PNG дважды.
 #[derive(Resource, Default)]
 pub struct TextureCache {
     pub map: std::collections::HashMap<String, Handle<Image>>,
 }
 
-/// Загрузить PNG-байты в Bevy Image asset.
 fn load_png_into_images(bytes: &[u8], images: &mut ResMut<Assets<Image>>) -> Option<Handle<Image>> {
     let img = image::load_from_memory(bytes).ok()?;
     let rgba = img.to_rgba8();
@@ -87,9 +86,6 @@ fn load_png_into_images(bytes: &[u8], images: &mut ResMut<Assets<Image>>) -> Opt
     Some(images.add(bevy_img))
 }
 
-/// Система сборки сцены из ScenePlan.
-/// ВАЖНО: здесь грузятся ТОЛЬКО текстуры тех нод, что реально спавнятся в
-/// стартовом наборе чанков (а не все 46 из ResolvedAssets).
 pub fn spawn_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -98,7 +94,6 @@ pub fn spawn_scene(
     plan: Res<ScenePlanResource>,
     resolved: Res<ResolvedAssetsResource>,
     mut tex_cache: ResMut<TextureCache>,
-    asset_server: Res<AssetServer>,
 ) {
     let plan = &plan.0;
     let mut player_spawned = false;
@@ -168,13 +163,7 @@ pub fn spawn_scene(
         }
 
         let mesh_handle = build_mesh_handle(&node.mesh, &mut meshes);
-
-        let material = build_material(
-            node,
-            &resolved,
-            &mut images,
-            &mut tex_cache,
-        );
+        let material = build_material(node, &resolved, &mut images, &mut tex_cache);
         let mat_handle = materials.add(material);
 
         let mut ecmd = commands.spawn((
@@ -205,9 +194,8 @@ pub fn spawn_scene(
         ));
     }
 
-    // Fallback-камера.
     if !player_spawned {
-        eprintln!("[game] ВНИМАНИЕ: нет узла Player. Спавним fallback-камеру в (0, 2, 0).");
+        eprintln!("[game] нет узла Player. Спавним fallback-камеру в (0, 2, 0).");
         let spawn_pos = plan
             .spawn_point
             .as_ref()
@@ -263,12 +251,8 @@ pub fn spawn_scene(
             brightness: 100.0,
         });
     }
-
-    // Тихий warning про AssetServer, чтобы не было unused warning.
-    let _ = asset_server;
 }
 
-/// Mesh из MeshSpec. Размеры — прямо в меш.
 fn build_mesh_handle(
     spec: &Option<crate::level::build::MeshSpec>,
     meshes: &mut ResMut<Assets<Mesh>>,
@@ -287,7 +271,6 @@ fn build_mesh_handle(
     }
 }
 
-/// StandardMaterial с PBR-текстурами. Ленивая загрузка.
 fn build_material(
     node: &crate::level::build::NodePlan,
     resolved: &ResolvedAssetsResource,
@@ -601,11 +584,45 @@ pub fn spawn_one_node(
     ));
 }
 
+/// Система: обработать нажатие «Export Level» из меню паузы.
+pub fn handle_export_request(
+    mut events: EventReader<crate::ui::ExportLevelRequest>,
+    paths: Option<Res<crate::paths::AppPathsResource>>,
+    active: Res<ActiveScene>,
+) {
+    for _ev in events.read() {
+        let Some(paths) = paths.as_ref() else {
+            eprintln!("[export] нет AppPathsResource");
+            continue;
+        };
+        match crate::level::export::export_level_zip(paths.paths(), active.level_number) {
+            Ok(zip) => {
+                println!("[export] zip готов: {}", zip.display());
+                // Открываем save-dialog.
+                let default_name = format!("level_{}.zip", active.level_number);
+                match crate::level::export_dialog::show_save_dialog(&default_name) {
+                    Some(target) => {
+                        match std::fs::copy(&zip, &target) {
+                            Ok(_) => println!("[export] сохранено в {}", target.display()),
+                            Err(e) => eprintln!("[export] ошибка копирования: {e}"),
+                        }
+                    }
+                    None => {
+                        println!("[export] пользователь отменил; файл остался в {}", zip.display());
+                    }
+                }
+            }
+            Err(e) => eprintln!("[export] ошибка: {e}"),
+        }
+    }
+}
+
 pub struct GamePlugin {
     pub plan: std::sync::Arc<ScenePlan>,
     pub assets: std::sync::Arc<ResolvedAssets>,
     pub engine: std::sync::Mutex<Option<ScriptEngine>>,
     pub level_number: u32,
+    pub net_ctx: Option<NetContext>,
 }
 
 impl Plugin for GamePlugin {
@@ -616,7 +633,12 @@ impl Plugin for GamePlugin {
             .init_resource::<ActiveScene>()
             .init_resource::<LoadedChunks>()
             .add_systems(Startup, spawn_scene)
-            .add_systems(Update, (run_on_level_start, tick_lua_timers, chunk_streaming_system));
+            .add_systems(Update, (
+                run_on_level_start,
+                tick_lua_timers,
+                chunk_streaming_system,
+                handle_export_request,
+            ));
 
         let mut active = ActiveScene::default();
         active.plan = ScenePlanPlaceholder::from(self.plan.as_ref());
@@ -625,6 +647,20 @@ impl Plugin for GamePlugin {
 
         if let Some(engine) = self.engine.lock().unwrap().take() {
             app.insert_non_send_resource(LuaRuntime(std::sync::Mutex::new(engine)));
+        }
+
+        if let Some(ctx) = &self.net_ctx {
+            // Клонируем — NetContext не Clone из-за реестра, но нам нужен
+            // уникальный инстанс. Пересоздаём.
+            let cloned = NetContext {
+                role: ctx.role,
+                host_base_url: ctx.host_base_url.clone(),
+                level_number: ctx.level_number,
+                net_port: ctx.net_port,
+                http_port: ctx.http_port,
+                chunks: crate::game::chunk_registry::ChunkRegistry::new(ctx.chunks.my_player_id),
+            };
+            app.insert_resource(cloned);
         }
     }
 }

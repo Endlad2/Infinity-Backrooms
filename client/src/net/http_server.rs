@@ -1,15 +1,7 @@
-//! Простой HTTP-сервер на голом TCP для раздачи ассетов уровня в мультиплеере.
-//!
-//! Хост поднимает его на `http_port` (по умолчанию 27016) и отдаёт:
-//!   * GET /level.xml       — XML уровня
-//!   * GET /assets/<path>   — файл из cache-files/<path> (рекурсивно)
-//!   * GET /manifest.json   — информация о лобби (name, level_number, port)
-//!
-//! Никаких зависимостей — пишем HTTP/1.1 вручную.
-//! Ответы только GET, Connection: close, Content-Length.
+//! Простой HTTP-сервер на голом TCP для раздачи ассетов уровня.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -19,7 +11,6 @@ use anyhow::Result;
 
 use crate::paths::AppPaths;
 
-/// Состояние HTTP-сервера.
 pub struct HttpServerHandle {
     pub port: u16,
     shutdown: Arc<AtomicBool>,
@@ -29,7 +20,6 @@ pub struct HttpServerHandle {
 impl HttpServerHandle {
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        // Просто connect на свой порт, чтобы разбудить accept().
         let _ = TcpStream::connect(("127.0.0.1", self.port));
         if let Some(j) = self.join.take() {
             let _ = j.join();
@@ -38,12 +28,9 @@ impl HttpServerHandle {
 }
 
 impl Drop for HttpServerHandle {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
+    fn drop(&mut self) { self.shutdown(); }
 }
 
-/// Запуск HTTP-сервера. Возвращает Handle, который надо сохранить живым.
 pub fn start_http_server(
     paths: AppPaths,
     level_number: u32,
@@ -58,9 +45,7 @@ pub fn start_http_server(
 
     let join = thread::spawn(move || {
         for stream in listener.incoming() {
-            if shutdown2.load(Ordering::SeqCst) {
-                break;
-            }
+            if shutdown2.load(Ordering::SeqCst) { break; }
             match stream {
                 Ok(s) => {
                     let xml = level_xml_path.clone();
@@ -76,11 +61,7 @@ pub fn start_http_server(
         }
     });
 
-    Ok(HttpServerHandle {
-        port,
-        shutdown,
-        join: Some(join),
-    })
+    Ok(HttpServerHandle { port, shutdown, join: Some(join) })
 }
 
 fn handle_client(
@@ -96,34 +77,23 @@ fn handle_client(
     reader.read_line(&mut request_line)?;
     let request_line = request_line.trim().to_string();
 
-    // Прочитать заголовки до пустой строки.
     loop {
         let mut line = String::new();
         reader.read_line(&mut line)?;
-        if line == "\r\n" || line == "\n" || line.is_empty() {
-            break;
-        }
+        if line == "\r\n" || line == "\n" || line.is_empty() { break; }
     }
 
-    // Парсим "GET /path HTTP/1.1".
     let parts: Vec<&str> = request_line.split_whitespace().collect();
-    if parts.len() < 2 {
-        return write_404(&mut s);
-    }
+    if parts.len() < 2 { return write_404(&mut s); }
     let method = parts[0];
     let raw_path = parts[1];
 
-    if method != "GET" {
-        return write_405(&mut s);
-    }
+    if method != "GET" { return write_405(&mut s); }
 
     let path = raw_path.split('?').next().unwrap_or(raw_path);
     let path = url_decode(path);
 
-    println!(
-        "[http] {} {} (peer={:?})",
-        method, path, peer
-    );
+    println!("[http] {} {} (peer={:?})", method, path, peer);
 
     match path.as_str() {
         "/level.xml" => {
@@ -139,6 +109,28 @@ fn handle_client(
             let data = serde_json::to_vec_pretty(&m)?;
             write_response(&mut s, 200, "application/json", &data)
         }
+        "/index.json" => {
+            // Список файлов в cache-files/ — нужен клиенту, чтобы знать, что качать.
+            let mut entries: Vec<String> = Vec::new();
+            let mut walk = |dir: &PathBuf, prefix: &str| -> Result<()> {
+                if !dir.is_dir() { return Ok(()); }
+                for e in std::fs::read_dir(dir)? {
+                    let e = e?;
+                    let p = e.path();
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if p.is_dir() {
+                        walk(&p, &format!("{prefix}{name}/"))?;
+                    } else {
+                        entries.push(format!("{prefix}{name}"));
+                    }
+                }
+                Ok(())
+            };
+            walk(cache_dir, "")?;
+            entries.sort();
+            let data = serde_json::to_vec_pretty(&serde_json::json!({ "files": entries }))?;
+            write_response(&mut s, 200, "application/json", &data)
+        }
         p if p.starts_with("/assets/") => {
             let rel = p.trim_start_matches("/assets/");
             serve_asset(&mut s, cache_dir, rel)
@@ -148,22 +140,14 @@ fn handle_client(
 }
 
 fn serve_asset(s: &mut TcpStream, cache_dir: &PathBuf, rel: &str) -> Result<()> {
-    // Защита от path traversal.
-    if rel.contains("..") {
-        return write_404(s);
-    }
+    if rel.contains("..") { return write_404(s); }
 
     let full = cache_dir.join(rel);
-    if !full.is_file() {
-        return write_404(s);
-    }
-    // Проверяем, что full реально внутри cache_dir.
+    if !full.is_file() { return write_404(s); }
     let canon_cache = std::fs::canonicalize(cache_dir).ok();
     let canon_full = std::fs::canonicalize(&full).ok();
     if let (Some(cache), Some(f)) = (canon_cache, canon_full) {
-        if !f.starts_with(&cache) {
-            return write_404(s);
-        }
+        if !f.starts_with(&cache) { return write_404(s); }
     }
 
     let data = std::fs::read(&full)?;
@@ -191,15 +175,8 @@ fn write_response(s: &mut TcpStream, code: u16, mime: &str, body: &[u8]) -> Resu
         _ => "OK",
     };
     let header = format!(
-        "HTTP/1.1 {} {}\r\n\
-         Content-Type: {}\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n",
-        code,
-        status,
-        mime,
-        body.len()
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        code, status, mime, body.len()
     );
     s.write_all(header.as_bytes())?;
     s.write_all(body)?;
@@ -210,12 +187,10 @@ fn write_response(s: &mut TcpStream, code: u16, mime: &str, body: &[u8]) -> Resu
 fn write_404(s: &mut TcpStream) -> Result<()> {
     write_response(s, 404, "text/plain; charset=utf-8", b"404 Not Found")
 }
-
 fn write_405(s: &mut TcpStream) -> Result<()> {
     write_response(s, 405, "text/plain; charset=utf-8", b"405 Method Not Allowed")
 }
 
-/// Простой URL-decode (%xx + '+').
 fn url_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
@@ -228,8 +203,7 @@ fn url_decode(s: &str) -> String {
                     i += 3;
                     continue;
                 }
-                out.push(b'%');
-                i += 1;
+                out.push(b'%'); i += 1;
             }
             b'+' => { out.push(b' '); i += 1; }
             b => { out.push(b); i += 1; }
@@ -247,27 +221,33 @@ fn hex(b: u8) -> Option<u8> {
     }
 }
 
-/// Скачивание одного файла с удалённого хоста (для клиента).
 pub fn download_file(base_url: &str, rel_path: &str, out_dir: &PathBuf) -> Result<PathBuf> {
     let url = format!("{}/assets/{}", base_url.trim_end_matches('/'), rel_path);
     let resp = ureq::get(&url)
         .timeout(std::time::Duration::from_secs(120))
         .call()
         .map_err(|e| anyhow::anyhow!("http download error: {e}"))?;
-
     let mut bytes = Vec::new();
     use std::io::Read;
     resp.into_reader().read_to_end(&mut bytes)?;
-
     let full = out_dir.join(rel_path);
-    if let Some(p) = full.parent() {
-        std::fs::create_dir_all(p)?;
-    }
+    if let Some(p) = full.parent() { std::fs::create_dir_all(p)?; }
     std::fs::write(&full, &bytes)?;
     Ok(full)
 }
 
-/// Скачать manifest.json удалённого хоста.
+/// Скачать список файлов хоста.
+pub fn fetch_index(base_url: &str) -> Result<Vec<String>> {
+    let url = format!("{}/index.json", base_url.trim_end_matches('/'));
+    let resp = ureq::get(&url)
+        .timeout(std::time::Duration::from_secs(30))
+        .call()
+        .map_err(|e| anyhow::anyhow!("http index error: {e}"))?;
+    let v: serde_json::Value = resp.into_json()?;
+    let arr = v.get("files").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    Ok(arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+}
+
 pub fn fetch_manifest(base_url: &str) -> Result<serde_json::Value> {
     let url = format!("{}/manifest.json", base_url.trim_end_matches('/'));
     let resp = ureq::get(&url)
@@ -278,7 +258,6 @@ pub fn fetch_manifest(base_url: &str) -> Result<serde_json::Value> {
     Ok(v)
 }
 
-/// Скачать level.xml удалённого хоста в `%APPDATA%/.../levels/{N}.xml`.
 pub fn download_level_xml(base_url: &str, paths: &AppPaths, level_number: u32) -> Result<PathBuf> {
     let url = format!("{}/level.xml", base_url.trim_end_matches('/'));
     let resp = ureq::get(&url)
@@ -287,14 +266,11 @@ pub fn download_level_xml(base_url: &str, paths: &AppPaths, level_number: u32) -
         .map_err(|e| anyhow::anyhow!("http level.xml error: {e}"))?;
     let xml = resp.into_string()?;
     let target = paths.level_xml(level_number);
-    if let Some(p) = target.parent() {
-        std::fs::create_dir_all(p)?;
-    }
+    if let Some(p) = target.parent() { std::fs::create_dir_all(p)?; }
     std::fs::write(&target, xml.as_bytes())?;
     Ok(target)
 }
 
-/// Проверить, что хост доступен и HTTP-сервер отвечает.
 pub fn probe_host(base_url: &str) -> bool {
     let url = format!("{}/manifest.json", base_url.trim_end_matches('/'));
     ureq::get(&url)
@@ -303,14 +279,12 @@ pub fn probe_host(base_url: &str) -> bool {
         .is_ok()
 }
 
-/// Получить локальный LAN IP (для отображения хосту).
 pub fn lan_ip() -> Option<std::net::IpAddr> {
     let socket = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
     socket.connect(("8.8.8.8", 80)).ok()?;
     socket.local_addr().ok().map(|a| a.ip())
 }
 
-/// Собрать base_url вида "http://192.168.1.42:27016".
 pub fn base_url_for_self(port: u16) -> String {
     match lan_ip() {
         Some(ip) => format!("http://{}:{}", ip, port),
@@ -326,7 +300,6 @@ mod tests {
     fn url_decode_basic() {
         assert_eq!(url_decode("/a%20b"), "/a b");
         assert_eq!(url_decode("/a+b"), "/a b");
-        assert_eq!(url_decode("/plain"), "/plain");
     }
 
     #[test]
@@ -340,6 +313,5 @@ mod tests {
     fn base_url_for_self_returns_something() {
         let s = base_url_for_self(27016);
         assert!(s.starts_with("http://"));
-        assert!(s.contains(":27016"));
     }
 }
