@@ -39,7 +39,6 @@ fn main() -> Result<()> {
 
     let paths = AppPaths::discover()?;
     paths.ensure_dirs()?;
-
     let settings = Settings::load(&paths.settings_json);
     let _ = levels_json::load_or_init(&paths.levels_json);
 
@@ -54,7 +53,6 @@ fn sync_gltf_to_assets(paths: &AppPaths) -> Result<()> {
     let cache = &paths.cache_files_dir;
     let target_models = &paths.models_dir;
     if !cache.is_dir() { return Ok(()); }
-
     for entry in std::fs::read_dir(cache)? {
         let entry = entry?;
         let path = entry.path();
@@ -78,21 +76,13 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
         let entry = entry?;
         let p = entry.path();
         let target = dst.join(entry.file_name());
-        if p.is_dir() {
-            copy_dir_recursive(&p, &target)?;
-        } else {
-            std::fs::copy(&p, &target)?;
-        }
+        if p.is_dir() { copy_dir_recursive(&p, &target)?; }
+        else { std::fs::copy(&p, &target)?; }
     }
     Ok(())
 }
 
-fn run_single(
-    cli: &Cli,
-    paths: &AppPaths,
-    settings: &Settings,
-    texture_res: &str,
-) -> Result<()> {
+fn run_single(cli: &Cli, paths: &AppPaths, settings: &Settings, texture_res: &str) -> Result<()> {
     let level_number = cli.level.unwrap_or(0);
     let level_xml_path = paths.level_xml(level_number);
 
@@ -106,10 +96,7 @@ fn run_single(
             std::fs::write(&level_xml_path, fallback)?;
         }
     }
-
-    if let Err(e) = sync_gltf_to_assets(paths) {
-        eprintln!("[assets] gltf sync: {e}");
-    }
+    if let Err(e) = sync_gltf_to_assets(paths) { eprintln!("[assets] gltf sync: {e}"); }
 
     let xml = std::fs::read_to_string(&level_xml_path)?;
     let level = parse_level_xml(&xml)?;
@@ -119,61 +106,40 @@ fn run_single(
     let assets_arc = Arc::new(assets);
 
     let mut engine = ScriptEngine::new()?;
-    let scripts: Vec<(String, String)> = level
-        .scripts.iter().map(|s| (s.id.clone(), s.lua.clone())).collect();
-    engine.load_scripts(scripts.iter().map(|(a, b)| (a, b)))
-        .map_err(|e| anyhow!("Lua: {e}"))?;
+    let scripts: Vec<(String, String)> = level.scripts.iter()
+        .map(|s| (s.id.clone(), s.lua.clone())).collect();
+    engine.load_scripts(scripts.iter().map(|(a, b)| (a, b)))?;
 
     println!("Запуск одиночной игры: уровень {level_number} (textures={texture_res})");
     run_bevy(plan, assets_arc, Some(engine), level_number, settings, paths.clone(), None);
     Ok(())
 }
 
-fn run_host(
-    cli: &Cli,
-    paths: &AppPaths,
-    settings: &Settings,
-    texture_res: &str,
-) -> Result<()> {
+fn run_host(cli: &Cli, paths: &AppPaths, settings: &Settings, texture_res: &str) -> Result<()> {
     let level_number = cli.level.unwrap_or(0);
     println!("Мультиплеер — ХОСТ на уровне {level_number}");
 
-    // 1. Генерируем уровень.
     let level_xml_path = paths.level_xml(level_number);
     if !level_xml_path.is_file() {
         println!("Генерация уровня для хоста...");
-        if let Err(e) = level::gen::generate_level_full(
-            paths, level_number, None, texture_res,
-        ) {
+        if let Err(e) = level::gen::generate_level_full(paths, level_number, None, texture_res) {
             eprintln!("Генерация не удалась: {e}. Offline fallback.");
             let fallback = crate::level::gen::offline_level_xml(level_number);
             std::fs::write(&level_xml_path, fallback)?;
         }
     }
 
-    // 2. HTTP-сервер для раздачи ассетов.
     let handle = net::http_server::start_http_server(
-        paths.clone(),
-        level_number,
-        cli.http_port,
+        paths.clone(), level_number, cli.http_port,
         format!("Backrooms Lobby {level_number}"),
     )?;
-    println!(
-        "[host] HTTP-сервер: {}",
-        net::http_server::base_url_for_self(cli.http_port)
-    );
-    println!("[host] Скажи друзьям IP: {}", net::host::display_lan_ip());
-    println!("[host] UDP-порт: {}", cli.net_port);
-
-    // Держим handle живым весь процесс.
+    println!("[host] HTTP-сервер: {}", net::http_server::base_url_for_self(cli.http_port));
+    println!("[host] IP: {}", net::host::display_lan_ip());
     std::mem::forget(handle);
 
-    // 3. UDP-лобби (запустится в фоне и будет polling'иться в игровом цикле).
     let _host = net::host::start_lobby_with_level(cli.net_port, level_number, cli.http_port)?;
+    if let Err(e) = sync_gltf_to_assets(paths) { eprintln!("[assets] gltf sync: {e}"); }
 
-    if let Err(e) = sync_gltf_to_assets(paths) {
-        eprintln!("[assets] gltf sync: {e}");
-    }
     let xml = std::fs::read_to_string(&level_xml_path)?;
     let level = parse_level_xml(&xml)?;
     let resolver = Resolver::open(paths)?;
@@ -182,8 +148,8 @@ fn run_host(
     let assets_arc = Arc::new(assets);
 
     let mut engine = ScriptEngine::new()?;
-    let scripts: Vec<(String, String)> = level
-        .scripts.iter().map(|s| (s.id.clone(), s.lua.clone())).collect();
+    let scripts: Vec<(String, String)> = level.scripts.iter()
+        .map(|s| (s.id.clone(), s.lua.clone())).collect();
     engine.load_scripts(scripts.iter().map(|(a, b)| (a, b)))?;
 
     let net_ctx = crate::game::NetContext::host(cli.net_port, cli.http_port, level_number);
@@ -197,7 +163,6 @@ fn run_join(cli: &Cli, paths: &AppPaths, texture_res: &str) -> Result<()> {
     let _ = texture_res;
 
     let mut client = net::client::connect(&format!("{}:{}", ip, cli.net_port), "player")?;
-
     let start = std::time::Instant::now();
     let mut host_base_url: Option<String> = None;
     let mut level_number: u32 = 0;
@@ -210,7 +175,6 @@ fn run_join(cli: &Cli, paths: &AppPaths, texture_res: &str) -> Result<()> {
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-
     let Some(base_url) = host_base_url else {
         return Err(anyhow!("Хост не ответил ConnectAck за 10 секунд"));
     };
@@ -219,14 +183,12 @@ fn run_join(cli: &Cli, paths: &AppPaths, texture_res: &str) -> Result<()> {
     if !net::http_server::probe_host(&base_url) {
         return Err(anyhow!("HTTP-сервер хоста {base_url} недоступен"));
     }
-
     net::http_server::download_level_xml(&base_url, paths, level_number)?;
     println!("[join] level.xml скачан");
 
-    // Скачиваем все ассеты хоста.
     match net::http_server::fetch_index(&base_url) {
         Ok(files) => {
-            println!("[join] файлов в cache-files/ у хоста: {}", files.len());
+            println!("[join] файлов у хоста: {}", files.len());
             for f in &files {
                 let target = paths.cache_files_dir.join(f);
                 if target.is_file() { continue; }
@@ -236,12 +198,10 @@ fn run_join(cli: &Cli, paths: &AppPaths, texture_res: &str) -> Result<()> {
                 }
             }
         }
-        Err(e) => eprintln!("[join] не удалось получить index.json: {e}"),
+        Err(e) => eprintln!("[join] index.json недоступен: {e}"),
     }
 
-    if let Err(e) = sync_gltf_to_assets(paths) {
-        eprintln!("[assets] gltf sync: {e}");
-    }
+    if let Err(e) = sync_gltf_to_assets(paths) { eprintln!("[assets] gltf sync: {e}"); }
     let xml = std::fs::read_to_string(paths.level_xml(level_number))?;
     let level = parse_level_xml(&xml)?;
     let resolver = Resolver::open(paths)?;
@@ -250,8 +210,8 @@ fn run_join(cli: &Cli, paths: &AppPaths, texture_res: &str) -> Result<()> {
     let assets_arc = Arc::new(assets);
 
     let mut engine = ScriptEngine::new()?;
-    let scripts: Vec<(String, String)> = level
-        .scripts.iter().map(|s| (s.id.clone(), s.lua.clone())).collect();
+    let scripts: Vec<(String, String)> = level.scripts.iter()
+        .map(|s| (s.id.clone(), s.lua.clone())).collect();
     engine.load_scripts(scripts.iter().map(|(a, b)| (a, b)))?;
 
     let net_ctx = crate::game::NetContext::client(base_url, level_number);
@@ -270,11 +230,17 @@ fn run_bevy(
     net_ctx: Option<crate::game::NetContext>,
 ) {
     use bevy::prelude::*;
+    use bevy::window::{CursorGrabMode, CursorOptions};
 
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
             title: format!("Backrooms Infinity — Level {level_number}"),
+            cursor: CursorOptions {
+                visible: false,
+                grab_mode: CursorGrabMode::Locked,
+                ..default()
+            },
             ..default()
         }),
         ..default()
@@ -284,10 +250,10 @@ fn run_bevy(
     app.insert_resource(player::MouseSensitivity(settings.mouse_sensitivity));
     app.add_plugins(player::controller::PlayerPlugin);
     app.add_plugins(player::camera::CameraPlugin);
+    app.add_plugins(player::cursor_grab::CursorGrabPlugin);
     app.add_plugins(ui::PausePlugin::default());
     app.add_plugins(GamePlugin {
-        plan,
-        assets,
+        plan, assets,
         engine: std::sync::Mutex::new(engine),
         level_number,
         net_ctx,

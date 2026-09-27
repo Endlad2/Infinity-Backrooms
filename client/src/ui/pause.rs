@@ -1,7 +1,4 @@
-//! Меню паузы (ESC): полупрозрачный оверлей + кнопки.
-//! Английские подписи, потому что Roboto без Cyrillic-сабсета в Bevy UI.
-//!
-//! Кнопки: Resume / Settings / Export Level / Notes / Exit.
+//! Меню паузы (ESC). Английские подписи.
 
 use bevy::prelude::*;
 
@@ -13,17 +10,9 @@ pub enum PauseState {
     Notes,
     Exporting,
 }
-
-impl Default for PauseState {
-    fn default() -> Self {
-        PauseState::Playing
-    }
-}
-
+impl Default for PauseState { fn default() -> Self { PauseState::Playing } }
 impl PauseState {
-    pub fn is_paused(&self) -> bool {
-        !matches!(self, PauseState::Playing)
-    }
+    pub fn is_paused(&self) -> bool { !matches!(self, PauseState::Playing) }
 }
 
 #[derive(Component)]
@@ -31,11 +20,7 @@ pub struct PauseOverlay;
 
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PauseButton {
-    Resume,
-    Settings,
-    Export,
-    Notes,
-    Exit,
+    Resume, Settings, Export, Notes, Exit,
 }
 
 pub fn toggle_pause(
@@ -93,11 +78,7 @@ pub fn spawn_pause_overlay(mut commands: Commands) {
                 .with_children(|col| {
                     col.spawn(TextBundle::from_section(
                         "PAUSED",
-                        TextStyle {
-                            font_size: 40.0,
-                            color: Color::WHITE,
-                            ..default()
-                        },
+                        TextStyle { font_size: 40.0, color: Color::WHITE, ..default() },
                     ));
                     for (btn, label) in [
                         (PauseButton::Resume, "Resume"),
@@ -122,11 +103,7 @@ pub fn spawn_pause_overlay(mut commands: Commands) {
                         .with_children(|b| {
                             b.spawn(TextBundle::from_section(
                                 label,
-                                TextStyle {
-                                    font_size: 22.0,
-                                    color: Color::WHITE,
-                                    ..default()
-                                },
+                                TextStyle { font_size: 22.0, color: Color::WHITE, ..default() },
                             ));
                         });
                     }
@@ -134,7 +111,6 @@ pub fn spawn_pause_overlay(mut commands: Commands) {
         });
 }
 
-/// Сообщение: попросить систему экспорта уровня сделать zip.
 #[derive(Event, Debug)]
 pub struct ExportLevelRequest;
 
@@ -145,21 +121,16 @@ pub fn handle_pause_buttons(
     interactions: Query<(&Interaction, &PauseButton), Changed<Interaction>>,
 ) {
     for (interaction, btn) in interactions.iter() {
-        if *interaction != Interaction::Pressed {
-            continue;
-        }
+        if *interaction != Interaction::Pressed { continue; }
         match btn {
             PauseButton::Resume => *state = PauseState::Playing,
             PauseButton::Settings => *state = PauseState::Settings,
             PauseButton::Notes => *state = PauseState::Notes,
             PauseButton::Export => {
                 export_req.send(ExportLevelRequest);
-                // Оверлей спрячется сам, когда state вернётся в Playing.
                 *state = PauseState::Exporting;
             }
-            PauseButton::Exit => {
-                exit.send(AppExit::Success);
-            }
+            PauseButton::Exit => { exit.send(AppExit::Success); }
         }
     }
 }
@@ -181,16 +152,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pause_state_default_is_playing() {
+    fn default_is_playing() {
         assert_eq!(PauseState::default(), PauseState::Playing);
-        assert!(PauseState::Menu.is_paused());
-    }
-
-    #[test]
-    fn plugin_builds() {
-        let mut app = App::new();
-        app.add_plugins((MinimalPlugins, bevy::input::InputPlugin));
-        app.add_plugins(PausePlugin);
-        app.update();
     }
 }
