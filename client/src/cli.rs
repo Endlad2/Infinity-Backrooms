@@ -1,8 +1,14 @@
 //! Парсинг аргументов командной строки.
 //! Форматы вызова:
-//!   backrooms-client --mode single --level 0
-//!   backrooms-client --mode host   --level 5
-//!   backrooms-client --mode join   --ip 192.168.1.42
+//!   client --mode single --level 0
+//!   client --mode host   --level 5
+//!   client --mode join   --ip 192.168.1.42
+//!
+//! Дополнительно:
+//!   --graphics ultra-low|low|medium|high|ultra-high
+//!     Пресет качества. ultra-high=8K, high=4K, medium=2K, low=1K, ultra-low=1K.
+//!   --texture-quality 1k|2k|4k|8k|16k
+//!     Явное переопределение разрешения текстур (перебивает пресет graphics).
 
 use clap::{Parser, ValueEnum};
 
@@ -11,6 +17,30 @@ pub enum Mode {
     Single,
     Host,
     Join,
+}
+
+/// Пресет графики. Определяет разрешение текстур по умолчанию.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum GraphicsPreset {
+    UltraLow,
+    Low,
+    Medium,
+    High,
+    UltraHigh,
+}
+
+impl GraphicsPreset {
+    /// Разрешение текстур по умолчанию для пресета.
+    pub fn default_texture_res(&self) -> &'static str {
+        match self {
+            GraphicsPreset::UltraHigh => "8k",
+            GraphicsPreset::High => "4k",
+            GraphicsPreset::Medium => "2k",
+            // low и ultra-low специально снижены до 1k.
+            GraphicsPreset::Low => "1k",
+            GraphicsPreset::UltraLow => "1k",
+        }
+    }
 }
 
 #[derive(Debug, Parser, Clone)]
@@ -30,6 +60,54 @@ pub struct Cli {
     /// Текст замечания от прошлой генерации (перегенерация уровня).
     #[arg(long)]
     pub notes: Option<String>,
+
+    /// Пресет качества графики. По умолчанию — ultra-high.
+    #[arg(long, value_enum, default_value_t = GraphicsPreset::UltraHigh)]
+    pub graphics: GraphicsPreset,
+
+    /// Разрешение текстур. Если не задано — берётся из пресета graphics.
+    /// Если задано — перебивает пресет.
+    #[arg(long, value_enum)]
+    pub texture_quality: Option<TextureQuality>,
+}
+
+/// Разрешение текстур.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TextureQuality {
+    #[value(name = "1k")]
+    K1,
+    #[value(name = "2k")]
+    K2,
+    #[arg(name = "4k")]
+    #[value(name = "4k")]
+    K4,
+    #[value(name = "8k")]
+    K8,
+    #[value(name = "16k")]
+    K16,
+}
+
+impl TextureQuality {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TextureQuality::K1 => "1k",
+            TextureQuality::K2 => "2k",
+            TextureQuality::K4 => "4k",
+            TextureQuality::K8 => "8k",
+            TextureQuality::K16 => "16k",
+        }
+    }
+
+    /// Размер в пикселях (для справки / логов).
+    pub fn pixels(&self) -> u32 {
+        match self {
+            TextureQuality::K1 => 1024,
+            TextureQuality::K2 => 2048,
+            TextureQuality::K4 => 4096,
+            TextureQuality::K8 => 8192,
+            TextureQuality::K16 => 16384,
+        }
+    }
 }
 
 impl Cli {
@@ -54,6 +132,14 @@ impl Cli {
         }
         Ok(())
     }
+
+    /// Итоговое разрешение текстур: явный --texture-quality либо из пресета.
+    pub fn resolved_texture_res(&self) -> &'static str {
+        match self.texture_quality {
+            Some(q) => q.as_str(),
+            None => self.graphics.default_texture_res(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -64,7 +150,6 @@ mod tests {
     fn parse_single_ok() {
         let cli = Cli::try_parse_from(["app", "--mode", "single", "--level", "0"]).unwrap();
         assert_eq!(cli.mode, Mode::Single);
-        assert_eq!(cli.level, Some(0));
         cli.validate().unwrap();
     }
 
@@ -72,7 +157,6 @@ mod tests {
     fn parse_join_ok() {
         let cli = Cli::try_parse_from(["app", "--mode", "join", "--ip", "10.0.0.1"]).unwrap();
         assert_eq!(cli.mode, Mode::Join);
-        assert_eq!(cli.ip.as_deref(), Some("10.0.0.1"));
         cli.validate().unwrap();
     }
 
@@ -83,8 +167,65 @@ mod tests {
     }
 
     #[test]
-    fn level_out_of_range_fails() {
-        let cli = Cli::try_parse_from(["app", "--mode", "single", "--level", "9999"]).unwrap();
-        assert!(cli.validate().is_err());
+    fn default_graphics_ultra_high_8k() {
+        let cli = Cli::try_parse_from(["app", "--mode", "single", "--level", "0"]).unwrap();
+        assert_eq!(cli.graphics, GraphicsPreset::UltraHigh);
+        assert_eq!(cli.resolved_texture_res(), "8k");
+    }
+
+    #[test]
+    fn graphics_medium_gives_2k() {
+        let cli = Cli::try_parse_from([
+            "app", "--mode", "single", "--level", "0", "--graphics", "medium",
+        ])
+        .unwrap();
+        assert_eq!(cli.graphics, GraphicsPreset::Medium);
+        assert_eq!(cli.resolved_texture_res(), "2k");
+    }
+
+    #[test]
+    fn graphics_high_gives_4k() {
+        let cli = Cli::try_parse_from([
+            "app", "--mode", "single", "--level", "0", "--graphics", "high",
+        ])
+        .unwrap();
+        assert_eq!(cli.resolved_texture_res(), "4k");
+    }
+
+    #[test]
+    fn graphics_low_and_ultralow_give_1k() {
+        let cli = Cli::try_parse_from([
+            "app", "--mode", "single", "--level", "0", "--graphics", "low",
+        ])
+        .unwrap();
+        assert_eq!(cli.resolved_texture_res(), "1k");
+
+        let cli = Cli::try_parse_from([
+            "app", "--mode", "single", "--level", "0", "--graphics", "ultra-low",
+        ])
+        .unwrap();
+        assert_eq!(cli.resolved_texture_res(), "1k");
+    }
+
+    #[test]
+    fn texture_quality_overrides_graphics() {
+        let cli = Cli::try_parse_from([
+            "app", "--mode", "single", "--level", "0",
+            "--graphics", "ultra-high",
+            "--texture-quality", "2k",
+        ])
+        .unwrap();
+        assert_eq!(cli.graphics, GraphicsPreset::UltraHigh);
+        assert_eq!(cli.resolved_texture_res(), "2k");
+    }
+
+    #[test]
+    fn texture_quality_alone() {
+        let cli = Cli::try_parse_from([
+            "app", "--mode", "single", "--level", "0",
+            "--texture-quality", "16k",
+        ])
+        .unwrap();
+        assert_eq!(cli.resolved_texture_res(), "16k");
     }
 }

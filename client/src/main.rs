@@ -27,11 +27,16 @@ use crate::paths::AppPaths;
 use crate::scripting::ScriptEngine;
 use crate::settings::Settings;
 
-const DEFAULT_TEXTURE_RES: &str = "8k";
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
     cli.validate().map_err(|e| anyhow!(e))?;
+
+    // Разрешение текстур: --texture-quality или из пресета --graphics.
+    let texture_res = cli.resolved_texture_res();
+    println!(
+        "[cli] graphics={:?} texture-quality={:?} → resolution={}",
+        cli.graphics, cli.texture_quality, texture_res
+    );
 
     let paths = AppPaths::discover()?;
     paths.ensure_dirs()?;
@@ -40,15 +45,13 @@ fn main() -> Result<()> {
     let _ = levels_json::load_or_init(&paths.levels_json);
 
     match cli.mode {
-        Mode::Single => run_single(&cli, &paths, &settings),
-        Mode::Host => run_host(&cli, &paths, &settings),
+        Mode::Single => run_single(&cli, &paths, &settings, texture_res),
+        Mode::Host => run_host(&cli, &paths, &settings, texture_res),
         Mode::Join => run_join(&cli, &paths),
     }
 }
 
 /// Копирует cache-files/X_files/ → assets/models/X_files/, если ещё не скопировано.
-/// Нужно, чтобы AssetServer (который смотрит только в assets/ рядом с exe) мог
-/// найти gltf.
 fn sync_gltf_to_assets(paths: &AppPaths) -> Result<()> {
     let cache = &paths.cache_files_dir;
     let target_models = &paths.models_dir;
@@ -65,7 +68,7 @@ fn sync_gltf_to_assets(paths: &AppPaths) -> Result<()> {
         if !name.ends_with("_files") { continue; }
 
         let target_dir = target_models.join(name);
-        if target_dir.is_dir() { continue; } // уже скопировано
+        if target_dir.is_dir() { continue; }
         std::fs::create_dir_all(&target_dir)?;
         copy_dir_recursive(&path, &target_dir)?;
         println!("[assets] gltf скопирован: {} → {}", path.display(), target_dir.display());
@@ -88,7 +91,12 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
     Ok(())
 }
 
-fn run_single(cli: &Cli, paths: &AppPaths, settings: &Settings) -> Result<()> {
+fn run_single(
+    cli: &Cli,
+    paths: &AppPaths,
+    settings: &Settings,
+    texture_res: &str,
+) -> Result<()> {
     let level_number = cli.level.unwrap_or(0);
     let level_xml_path = paths.level_xml(level_number);
 
@@ -98,7 +106,7 @@ fn run_single(cli: &Cli, paths: &AppPaths, settings: &Settings) -> Result<()> {
             paths,
             level_number,
             cli.notes.as_deref(),
-            DEFAULT_TEXTURE_RES,
+            texture_res,
         ) {
             eprintln!("Генерация не удалась: {e}. Используем встроенный offline-уровень.");
             let fallback = crate::level::gen::offline_level_xml(level_number);
@@ -106,7 +114,6 @@ fn run_single(cli: &Cli, paths: &AppPaths, settings: &Settings) -> Result<()> {
         }
     }
 
-    // Копируем gltf из cache-files в assets/models/ — AssetServer туда смотрит.
     if let Err(e) = sync_gltf_to_assets(paths) {
         eprintln!("[assets] не удалось синхронизировать gltf: {e}");
     }
@@ -130,16 +137,21 @@ fn run_single(cli: &Cli, paths: &AppPaths, settings: &Settings) -> Result<()> {
         .load_scripts(scripts.iter().map(|(a, b)| (a, b)))
         .map_err(|e| anyhow!("Lua: {e}"))?;
 
-    println!("Запуск одиночной игры: уровень {level_number}");
-    run_bevy(plan, assets_arc, Some(engine), level_number, settings, paths);
+    println!("Запуск одиночной игры: уровень {level_number} (textures={texture_res})");
+    run_bevy(plan, assets_arc, Some(engine), level_number, settings);
     Ok(())
 }
 
-fn run_host(cli: &Cli, paths: &AppPaths, settings: &Settings) -> Result<()> {
+fn run_host(
+    cli: &Cli,
+    paths: &AppPaths,
+    settings: &Settings,
+    texture_res: &str,
+) -> Result<()> {
     let level_number = cli.level.unwrap_or(0);
     println!("Мультиплеер — ХОСТ на уровне {level_number}");
     let _ = crate::net::host::start_lobby(27015)?;
-    run_single(cli, paths, settings)
+    run_single(cli, paths, settings, texture_res)
 }
 
 fn run_join(cli: &Cli, _paths: &AppPaths) -> Result<()> {
@@ -155,7 +167,6 @@ fn run_bevy(
     engine: Option<ScriptEngine>,
     level_number: u32,
     settings: &Settings,
-    paths: &AppPaths,
 ) {
     use bevy::prelude::*;
 
@@ -168,10 +179,6 @@ fn run_bevy(
         ..default()
     }));
 
-    // Добавляем asset source для cache-files/ (чтобы AssetServer мог искать gltf).
-    // В Bevy 0.14 это делается через AssetPlugin::file_path, но проще —
-    // синхронизировать файлы в assets/. Мы уже сделали sync_gltf_to_assets.
-
     app.insert_resource(player::MouseSensitivity(settings.mouse_sensitivity));
     app.add_plugins(player::controller::PlayerPlugin);
     app.add_plugins(player::camera::CameraPlugin);
@@ -182,8 +189,5 @@ fn run_bevy(
         engine: std::sync::Mutex::new(engine),
         level_number,
     });
-
-    let _ = paths; // пока не используется в run_bevy
-
     app.run();
 }

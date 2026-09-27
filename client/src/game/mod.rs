@@ -1,12 +1,17 @@
-//! Основной игровой модуль Bevy: сборка сцены из ScenePlan,
-//! ПРИМЕНЕНИЕ PBR-текстур и gltf-моделей, Lua-хуки, чанковый стриминг.
+//! Основной игровой модуль Bevy.
+//!
+//! Обновлено: НЕ грузим все PNG сразу. Декодируем текстуры ЛЕНИВО, только
+//! когда чанк реально спавнится и его меши ссылаются на материал.
+//! Плюс мягкий лимит на количество загруженных текстур: если превышен —
+//! самые старые Handle выгружаются (через drop) — но проще: грузим
+//! только те текстуры, что встречаются в заспавненных чанках, а не все 46.
 
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::render::texture::Image;
 
-use crate::level::build::{ColliderPlan, LightKindPlan, MeshKind, NodeKind, ScenePlan};
 use crate::level::assets_bridge::ResolvedAssets;
+use crate::level::build::{ColliderPlan, LightKindPlan, MeshKind, NodeKind, ScenePlan};
 use crate::scripting::ScriptEngine;
 
 #[derive(Resource, Default)]
@@ -43,7 +48,7 @@ pub struct SceneNodeId(pub String);
 #[derive(Component, Debug, Clone)]
 pub struct SceneTriggerId(pub String);
 
-/// Ресурс с разрешёнными ассетами уровня (PNG-байты, OBJ-текст, gltf-пути).
+/// Ресурс с разрешёнными ассетами уровня (PNG-байты, OBJ-текст).
 #[derive(Resource, Default)]
 pub struct ResolvedAssetsResource {
     pub textures: std::collections::BTreeMap<String, Vec<u8>>,
@@ -61,7 +66,13 @@ impl From<&ResolvedAssets> for ResolvedAssetsResource {
     }
 }
 
-/// Загрузить PNG-байты в Bevy Image asset, вернуть Handle<Image>.
+/// Кэш загруженных GPU-текстур, чтобы не грузить одну PNG дважды.
+#[derive(Resource, Default)]
+pub struct TextureCache {
+    pub map: std::collections::HashMap<String, Handle<Image>>,
+}
+
+/// Загрузить PNG-байты в Bevy Image asset.
 fn load_png_into_images(bytes: &[u8], images: &mut ResMut<Assets<Image>>) -> Option<Handle<Image>> {
     let img = image::load_from_memory(bytes).ok()?;
     let rgba = img.to_rgba8();
@@ -77,6 +88,8 @@ fn load_png_into_images(bytes: &[u8], images: &mut ResMut<Assets<Image>>) -> Opt
 }
 
 /// Система сборки сцены из ScenePlan.
+/// ВАЖНО: здесь грузятся ТОЛЬКО текстуры тех нод, что реально спавнятся в
+/// стартовом наборе чанков (а не все 46 из ResolvedAssets).
 pub fn spawn_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -84,14 +97,11 @@ pub fn spawn_scene(
     mut images: ResMut<Assets<Image>>,
     plan: Res<ScenePlanResource>,
     resolved: Res<ResolvedAssetsResource>,
+    mut tex_cache: ResMut<TextureCache>,
     asset_server: Res<AssetServer>,
 ) {
     let plan = &plan.0;
     let mut player_spawned = false;
-
-    // Кэш загруженных текстур, чтобы не загружать одну PNG несколько раз.
-    let mut tex_cache: std::collections::HashMap<String, Handle<Image>> =
-        std::collections::HashMap::new();
 
     for node in &plan.nodes {
         let tf = Transform {
@@ -125,20 +135,7 @@ pub fn spawn_scene(
                             SceneNodeId(node.id.clone()),
                         ));
                     }
-                    LightKindPlan::Point => {
-                        commands.spawn((
-                            PointLight {
-                                color: c,
-                                intensity: intensity * 100_000.0,
-                                range: range.max(0.1),
-                                shadows_enabled: true,
-                                ..default()
-                            },
-                            tf,
-                            SceneNodeId(node.id.clone()),
-                        ));
-                    }
-                    LightKindPlan::Spot => {
+                    LightKindPlan::Point | LightKindPlan::Spot => {
                         commands.spawn((
                             PointLight {
                                 color: c,
@@ -170,16 +167,8 @@ pub fn spawn_scene(
             continue;
         }
 
-        // === Меш ===
-        let mesh_handle = build_mesh_handle(
-            &node.mesh,
-            &mut meshes,
-            &asset_server,
-            &mut commands,
-            &node.id,
-        );
+        let mesh_handle = build_mesh_handle(&node.mesh, &mut meshes);
 
-        // === Материал с PBR-текстурами ===
         let material = build_material(
             node,
             &resolved,
@@ -218,9 +207,7 @@ pub fn spawn_scene(
 
     // Fallback-камера.
     if !player_spawned {
-        eprintln!(
-            "[game] ВНИМАНИЕ: нет узла Player. Спавним fallback-камеру в (0, 2, 0)."
-        );
+        eprintln!("[game] ВНИМАНИЕ: нет узла Player. Спавним fallback-камеру в (0, 2, 0).");
         let spawn_pos = plan
             .spawn_point
             .as_ref()
@@ -276,16 +263,15 @@ pub fn spawn_scene(
             brightness: 100.0,
         });
     }
+
+    // Тихий warning про AssetServer, чтобы не было unused warning.
+    let _ = asset_server;
 }
 
-/// Строит MeshHandle из MeshSpec.
-/// Cuboid::new(size.x, size.y, size.z) — размеры прямо в меш.
+/// Mesh из MeshSpec. Размеры — прямо в меш.
 fn build_mesh_handle(
     spec: &Option<crate::level::build::MeshSpec>,
     meshes: &mut ResMut<Assets<Mesh>>,
-    asset_server: &Res<AssetServer>,
-    _commands: &mut Commands,
-    _node_id: &str,
 ) -> Handle<Mesh> {
     let Some(spec) = spec else {
         return meshes.add(Cuboid::new(1.0, 1.0, 1.0));
@@ -294,25 +280,19 @@ fn build_mesh_handle(
         MeshKind::Plane => meshes.add(Plane3d::default().mesh().size(spec.size[0], spec.size[2])),
         MeshKind::Cube => meshes.add(Cuboid::new(spec.size[0], spec.size[1], spec.size[2])),
         MeshKind::Sphere => meshes.add(Sphere::new(spec.size[0].max(0.01))),
-        MeshKind::Cylinder => meshes.add(Cylinder::new(spec.size[0].max(0.01), spec.size[1].max(0.01))),
-        MeshKind::Custom { model_id } => {
-            // Пытаемся загрузить gltf/glb из cache-files (через assets/ symlink).
-            // AssetServer не умеет смотреть в %APPDATA%, поэтому путь должен быть
-            // вида "models/X.gltf" относительно assets/ рядом с exe.
-            // Fallback — куб.
-            let _ = asset_server;
-            let _ = model_id;
-            meshes.add(Cuboid::new(1.0, 1.0, 1.0))
+        MeshKind::Cylinder => {
+            meshes.add(Cylinder::new(spec.size[0].max(0.01), spec.size[1].max(0.01)))
         }
+        MeshKind::Custom { .. } => meshes.add(Cuboid::new(1.0, 1.0, 1.0)),
     }
 }
 
-/// Собирает StandardMaterial с текстурами по MaterialPlan.
+/// StandardMaterial с PBR-текстурами. Ленивая загрузка.
 fn build_material(
     node: &crate::level::build::NodePlan,
     resolved: &ResolvedAssetsResource,
     images: &mut ResMut<Assets<Image>>,
-    cache: &mut std::collections::HashMap<String, Handle<Image>>,
+    cache: &mut ResMut<TextureCache>,
 ) -> StandardMaterial {
     let mut mat = StandardMaterial {
         base_color: Color::srgb(0.7, 0.7, 0.72),
@@ -321,41 +301,27 @@ fn build_material(
         ..default()
     };
 
-    // base_color_texture
     if let Some(id) = &node.material.base {
         if let Some(h) = get_or_load_image(id, resolved, images, cache) {
-            mat.base_color_texture = Some(h.clone());
-            // Если у нас PBR-набор — применим и tiling через UV-скейл.
-            // Bevy не имеет uv_scale в StandardMaterial, поэтому tiling
-            // применяется не здесь, а через mesh (см. build_mesh_handle → apply_tiling).
-            // Пока применяем к текстуре через sampler — это единственный путь без
-            // модификации меша. Если tiling нужен, передаём его как scale_sampler.
-            let _ = &node.material.tiling;
+            mat.base_color_texture = Some(h);
         }
     }
-
-    // normal_map_texture
     if let Some(id) = &node.material.normal {
         if let Some(h) = get_or_load_image(id, resolved, images, cache) {
-            mat.normal_map_texture = Some(h.clone());
+            mat.normal_map_texture = Some(h);
         }
     }
-
-    // metallic_roughness — используем rough как R-канал (приближение).
     if let Some(id) = &node.material.roughness {
         if let Some(h) = get_or_load_image(id, resolved, images, cache) {
-            mat.metallic_roughness_texture = Some(h.clone());
+            mat.metallic_roughness_texture = Some(h);
         }
     }
-
-    // occlusion
     if let Some(id) = &node.material.ao {
         if let Some(h) = get_or_load_image(id, resolved, images, cache) {
-            mat.occlusion_texture = Some(h.clone());
+            mat.occlusion_texture = Some(h);
         }
     }
 
-    // Inline цвет (если текстуры нет).
     if mat.base_color_texture.is_none() {
         if let Some(hex) = &node.material.color {
             mat.base_color = parse_hex_color(hex);
@@ -369,14 +335,14 @@ fn get_or_load_image(
     id: &str,
     resolved: &ResolvedAssetsResource,
     images: &mut ResMut<Assets<Image>>,
-    cache: &mut std::collections::HashMap<String, Handle<Image>>,
+    cache: &mut ResMut<TextureCache>,
 ) -> Option<Handle<Image>> {
-    if let Some(h) = cache.get(id) {
+    if let Some(h) = cache.map.get(id) {
         return Some(h.clone());
     }
     let bytes = resolved.textures.get(id)?;
     let h = load_png_into_images(bytes, images)?;
-    cache.insert(id.to_string(), h.clone());
+    cache.map.insert(id.to_string(), h.clone());
     Some(h)
 }
 
@@ -448,7 +414,7 @@ pub fn chunk_streaming_system(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
-    asset_server: Res<AssetServer>,
+    mut tex_cache: ResMut<TextureCache>,
 ) {
     *acc += time.delta_seconds();
     if *acc < 0.25 { return; }
@@ -484,7 +450,7 @@ pub fn chunk_streaming_system(
         meshes: &mut ResMut<Assets<Mesh>>,
         materials: &mut ResMut<Assets<StandardMaterial>>,
         images: &mut ResMut<Assets<Image>>,
-        asset_server: &Res<AssetServer>,
+        tex_cache: &mut ResMut<TextureCache>,
         resolved: &ResolvedAssetsResource,
         loaded: &mut ResMut<LoadedChunks>,
         tmpl: &crate::level::build::ChunkTemplatePlan,
@@ -497,11 +463,8 @@ pub fn chunk_streaming_system(
         let nodes = crate::level::build::expand_chunk_nodes(&tmpl.nodes, &cid, origin, Some(cs));
         let cell = ChunkCell(grid.0, grid.1, grid.2);
 
-        let mut cache: std::collections::HashMap<String, Handle<Image>> =
-            std::collections::HashMap::new();
-
         for n in &nodes {
-            spawn_one_node(commands, meshes, materials, images, asset_server, resolved, n, cell, &mut cache);
+            spawn_one_node(commands, meshes, materials, images, tex_cache, resolved, n, cell);
         }
         loaded.0.insert(grid);
     }
@@ -517,7 +480,8 @@ pub fn chunk_streaming_system(
                     seed, grid,
                 ).cloned();
                 if let Some(t) = picked {
-                    spawn_at(&mut commands, &mut meshes, &mut materials, &mut images, &asset_server, &resolved, &mut loaded, &t, grid, cs);
+                    spawn_at(&mut commands, &mut meshes, &mut materials, &mut images,
+                             &mut tex_cache, &resolved, &mut loaded, &t, grid, cs);
                 }
             }
         }
@@ -532,7 +496,8 @@ pub fn chunk_streaming_system(
                 seed, grid,
             ).cloned();
             if let Some(t) = picked {
-                spawn_at(&mut commands, &mut meshes, &mut materials, &mut images, &asset_server, &resolved, &mut loaded, &t, grid, cs);
+                spawn_at(&mut commands, &mut meshes, &mut materials, &mut images,
+                         &mut tex_cache, &resolved, &mut loaded, &t, grid, cs);
             }
         }
     }
@@ -545,7 +510,8 @@ pub fn chunk_streaming_system(
                 seed, grid,
             ).cloned();
             if let Some(t) = picked {
-                spawn_at(&mut commands, &mut meshes, &mut materials, &mut images, &asset_server, &resolved, &mut loaded, &t, grid, cs);
+                spawn_at(&mut commands, &mut meshes, &mut materials, &mut images,
+                         &mut tex_cache, &resolved, &mut loaded, &t, grid, cs);
             }
         }
     }
@@ -558,7 +524,8 @@ pub fn chunk_streaming_system(
                 seed, grid,
             ).cloned();
             if let Some(t) = picked {
-                spawn_at(&mut commands, &mut meshes, &mut materials, &mut images, &asset_server, &resolved, &mut loaded, &t, grid, cs);
+                spawn_at(&mut commands, &mut meshes, &mut materials, &mut images,
+                         &mut tex_cache, &resolved, &mut loaded, &t, grid, cs);
             }
         }
     }
@@ -585,11 +552,10 @@ pub fn spawn_one_node(
     meshes: &mut ResMut<Assets<Mesh>>,
     materials: &mut ResMut<Assets<StandardMaterial>>,
     images: &mut ResMut<Assets<Image>>,
-    asset_server: &Res<AssetServer>,
+    tex_cache: &mut ResMut<TextureCache>,
     resolved: &ResolvedAssetsResource,
     node: &crate::level::build::NodePlan,
     cell: ChunkCell,
-    cache: &mut std::collections::HashMap<String, Handle<Image>>,
 ) {
     use crate::level::build::{LightKindPlan, NodeKind};
 
@@ -625,8 +591,8 @@ pub fn spawn_one_node(
         }
     }
 
-    let mesh_handle = build_mesh_handle(&node.mesh, meshes, asset_server, commands, &node.id);
-    let mat = build_material(node, resolved, images, cache);
+    let mesh_handle = build_mesh_handle(&node.mesh, meshes);
+    let mat = build_material(node, resolved, images, tex_cache);
     let mat_handle = materials.add(mat);
 
     commands.spawn((
@@ -646,6 +612,7 @@ impl Plugin for GamePlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(ScenePlanResource(self.plan.clone()))
             .insert_resource(ResolvedAssetsResource::from(self.assets.as_ref()))
+            .init_resource::<TextureCache>()
             .init_resource::<ActiveScene>()
             .init_resource::<LoadedChunks>()
             .add_systems(Startup, spawn_scene)
