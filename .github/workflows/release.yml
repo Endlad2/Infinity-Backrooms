@@ -1,0 +1,79 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+          - os: ubuntu-latest
+            platform: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config clang cmake ninja-build libgtk-3-dev liblzma-dev
+      - run: cargo build --release --workspace
+      - name: Generate launcher wrappers
+        working-directory: launcher
+        run: flutter create --platforms=windows,linux --project-name backrooms_infinity_launcher .
+      - name: Build Windows launcher
+        if: runner.os == 'Windows'
+        working-directory: launcher
+        run: flutter build windows --release
+      - name: Build Linux launcher
+        if: runner.os == 'Linux'
+        working-directory: launcher
+        run: flutter build linux --release
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force package/bin | Out-Null
+          Copy-Item target/release/client.exe package/bin/client.exe
+          Copy-Item target/release/bi-lan.exe package/bin/bi-lan.exe
+          Copy-Item launcher/build/windows/x64/runner/Release/* package/bin -Recurse -Force
+          Copy-Item levels.json package/levels.json
+          Copy-Item README.md package/README.md
+          Compress-Archive package/* BackroomsInfinity-windows-x64.zip
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p package/bin
+          cp target/release/client package/bin/client
+          cp target/release/bi-lan package/bin/bi-lan
+          cp -a launcher/build/linux/x64/release/bundle/* package/bin/
+          cp levels.json README.md package/
+          tar -czf BackroomsInfinity-linux-x64.tar.gz -C package .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BackroomsInfinity-${{ matrix.platform }}
+          path: BackroomsInfinity-*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/BackroomsInfinity-*
+            levels/*.zip
+          generate_release_notes: true

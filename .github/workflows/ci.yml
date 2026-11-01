@@ -1,0 +1,64 @@
+name: CI
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  rust:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Linux Bevy dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
+      - run: cargo check --workspace
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets
+      - name: Validate bundled level packages
+        shell: python
+        run: |
+          import zipfile
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+          for archive in Path("levels").glob("*.zip"):
+              with zipfile.ZipFile(archive) as z:
+                  names = set(z.namelist())
+                  assert "level.xml" in names, f"{archive}: missing root level.xml"
+                  assert any(name.startswith("assets/") for name in names), f"{archive}: missing assets/"
+                  ET.fromstring(z.read("level.xml"))
+
+  launcher:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev
+      - name: Generate desktop wrappers
+        working-directory: launcher
+        run: flutter create --platforms=windows,linux --project-name backrooms_infinity_launcher .
+      - name: Analyze
+        working-directory: launcher
+        run: flutter analyze
+      - name: Build Windows
+        if: runner.os == 'Windows'
+        working-directory: launcher
+        run: flutter build windows --release
+      - name: Build Linux
+        if: runner.os == 'Linux'
+        working-directory: launcher
+        run: flutter build linux --release

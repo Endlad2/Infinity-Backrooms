@@ -1,0 +1,35 @@
+Backrooms Infinity source snapshot
+Generated: 2026-11-01
+
+SHA-256                                                           bytes      path
+45bba2f8b903abfc34905f6f874fd25df8d7fa8faa076623e46ef2235c9a9b23        2199  ./.github/workflows/ci.yml
+c863e30b7964f3d23b7d0d06d1ee33e3bd08c0382f639286f1cf395a287dc064        2726  ./.github/workflows/release.yml
+1231d632f476bdcff8bbd78ffa9ad76c25f565dffaf366015f691cbce1228b86         145  ./.gitignore
+a90db40212d820a7bd636e19d6329aca1c4f35206260bb47b5f36f1ac275f921         254  ./Cargo.toml
+09047c53a44f7f863b66b46aa1db252c9ef030da11928c0a73fe111c6ca619e9        1088  ./LICENSE
+cc0297b8fec72cdbb96012f38e7245041f3500d0f5945c5c1241d164cb83db45        6204  ./README.md
+9173d39b20ce9be0d6c9a4a14dd37973a1c6ce19970adada5a3454298835d9b8         530  ./bi-lan/Cargo.toml
+7124ab6566054a6af008ce4734ef4d500b1b346bf108b41595f23a12668e454c       12596  ./bi-lan/src/main.rs
+8bd13d23c2625709403eb1c57b06b957b72fa46d11b307dd1a457a9fea44b504         599  ./client/Cargo.toml
+69c3796157d016076bfeca023fbc523ba452dc00dbba48d345e9fd7329b281dd         746  ./client/src/args.rs
+dfa0931b6f90fb81c86f29648e8bbe7f72e7f950864e82f281ea2111af6c0dea        4045  ./client/src/inventory.rs
+97112f88cb2cbd610323896fa3b7b2a43594f95da64ae1d64351d98d6f862804       16962  ./client/src/level/lua.rs
+353bd21b39538a3ebeeec2fc3061b45e5b1fee27647ba66c2cc948c9e041db05        4845  ./client/src/level/mod.rs
+925c379a3bb3eca19bbbc4a4503d9e500a344c3c4280f92630ad4a8b6b9b7902       29508  ./client/src/level/runtime.rs
+2c613365c52390a1411e27531584edae19beb1c1e985a46c60ab63ec0159bda1       18974  ./client/src/level/schema.rs
+1c1511a150528ffe009c824f782ed5e0210a13564b760c2efbb6a6400789ad92       10462  ./client/src/level/xml.rs
+7ab4321d3312c631bbbb9494f8781d69f55da90eec44cc967910b6bc1f97b720       17590  ./client/src/main.rs
+e4edf07b6066d40facd35ea17e089bfc5704ccf4e427098282a551ac7ce0e9b7        2317  ./client/src/network.rs
+f3d6ad7e8f15305b17977cd3a6c3f8a7155d13fa4c8fe3400fc6b65796c61449        6825  ./docs/LEVEL_FORMAT.md
+29fa343713c52cdf5b20c43334b8e0d64a14c0bd3f589da7b37f0e0ca890eab3        4214  ./docs/LUA_API.md
+73374ffb873be9ee4fdb782b2e59aa13666b8de8927d5b7e1c8d11f81968e4c0        1194  ./docs/PROTOCOL.md
+558299807ac27cf090ed7e995e19440c0ac532a896d0df550c4e1e8d6ccf2818         814  ./install.ps1
+83f2870566ef72d027ae73b5e6a3d920d8045eaf8990fe83dcc47f6794d2c070        1082  ./install.sh
+c1e9534c05acb3643e72a82ad3d92d56d2ba9b0df2add014c18f7e1d462f24e4          44  ./launcher/analysis_options.yaml
+7c22163fdf0c351e18561309e0ad8c60b5ce80a0d2ddca8533f1fd200a002a40       16221  ./launcher/lib/main.dart
+440ea8b709b01adf1d491cbd047e6e7f89391ead033311efb13a9792d5ddff9a         322  ./launcher/pubspec.yaml
+ce4bf157fc759e34b489acea5aedf672c69dbbb0044969138fa091d48b418eb9      277730  ./levels/level-0.zip
+d1584ae38f3dc6b42a361aa42d2adefda3f7f94e5a97fb1804bc318ac6ef362f         131  ./levels.json
+3e18e70208ee460635e239a91c142cf67371feafb718b05617ff06f388bf96df          86  ./rust-toolchain.toml
+2e2170fc562f1d00b6699a75a93ee14f02172f502cd0239f7924ee462a8cb442         187  ./scripts/bootstrap_launcher.ps1
+f561e7e1072488367a8bcd068cd55d6f73b4bd8409aa46b276851526bd3c1b82         173  ./scripts/bootstrap_launcher.sh
