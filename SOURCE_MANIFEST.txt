@@ -3,7 +3,7 @@ Generated: 2026-11-04
 
 SHA-256                                                           bytes      path
 a30859e9cf3bb5cc3358471e53388944a769e4ef25064779aac2dfd5145a5dad        2289  ./.github/workflows/ci.yml
-c863e30b7964f3d23b7d0d06d1ee33e3bd08c0382f639286f1cf395a287dc064        2726  ./.github/workflows/release.yml
+9f0fc09a6865a52827c78cbdd367c43e80f9837a10f09825dd429eceeee9d088        2747  ./.github/workflows/release.yml
 1231d632f476bdcff8bbd78ffa9ad76c25f565dffaf366015f691cbce1228b86         145  ./.gitignore
 a90db40212d820a7bd636e19d6329aca1c4f35206260bb47b5f36f1ac275f921         254  ./Cargo.toml
 09047c53a44f7f863b66b46aa1db252c9ef030da11928c0a73fe111c6ca619e9        1088  ./LICENSE
