@@ -34,3 +34,4 @@ d1584ae38f3dc6b42a361aa42d2adefda3f7f94e5a97fb1804bc318ac6ef362f         131  ./
 3e18e70208ee460635e239a91c142cf67371feafb718b05617ff06f388bf96df          86  ./rust-toolchain.toml
 2e2170fc562f1d00b6699a75a93ee14f02172f502cd0239f7924ee462a8cb442         187  ./scripts/bootstrap_launcher.ps1
 f561e7e1072488367a8bcd068cd55d6f73b4bd8409aa46b276851526bd3c1b82         173  ./scripts/bootstrap_launcher.sh
+Updated: .github/workflows/release.yml now creates releases as YY.MM.DD-<7-char-commit-hash>.

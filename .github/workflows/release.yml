@@ -72,8 +72,18 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+      - name: Generate release tag
+        id: release_tag
+        shell: bash
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          DATE_TAG="$(date -u +'%y.%m.%d')"
+          echo "tag=${DATE_TAG}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          name: Backrooms Infinity ${{ steps.release_tag.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           files: |
             artifacts/BackroomsInfinity-*
             levels/*.zip
