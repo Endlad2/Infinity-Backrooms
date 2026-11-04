@@ -3,7 +3,7 @@ Generated: 2026-11-04
 
 SHA-256                                                           bytes      path
 a30859e9cf3bb5cc3358471e53388944a769e4ef25064779aac2dfd5145a5dad        2289  ./.github/workflows/ci.yml
-9f0fc09a6865a52827c78cbdd367c43e80f9837a10f09825dd429eceeee9d088        2747  ./.github/workflows/release.yml
+7a7d50d60c31576eb77965998862999559ba25c7ad78fad709a1c719bd8ca6aa        3165  ./.github/workflows/release.yml
 1231d632f476bdcff8bbd78ffa9ad76c25f565dffaf366015f691cbce1228b86         145  ./.gitignore
 a90db40212d820a7bd636e19d6329aca1c4f35206260bb47b5f36f1ac275f921         254  ./Cargo.toml
 09047c53a44f7f863b66b46aa1db252c9ef030da11928c0a73fe111c6ca619e9        1088  ./LICENSE
@@ -15,10 +15,10 @@ cc0297b8fec72cdbb96012f38e7245041f3500d0f5945c5c1241d164cb83db45        6204  ./
 dfa0931b6f90fb81c86f29648e8bbe7f72e7f950864e82f281ea2111af6c0dea        4045  ./client/src/inventory.rs
 97112f88cb2cbd610323896fa3b7b2a43594f95da64ae1d64351d98d6f862804       16962  ./client/src/level/lua.rs
 1f48269f88d91f499d8f211ad683639e3e576eb05a5489bddebdb946c67c4c6e        4809  ./client/src/level/mod.rs
-3bf86b57bb0dc59e154ea0a9e88637faf5c92ecfe61ab14df4f58102e70f3ec6       29794  ./client/src/level/runtime.rs
+b87658cfc4ba231145fdaffba7211fdebdcee89362734e2b1f80f527eaf1f321       29854  ./client/src/level/runtime.rs
 2c613365c52390a1411e27531584edae19beb1c1e985a46c60ab63ec0159bda1       18974  ./client/src/level/schema.rs
 1c1511a150528ffe009c824f782ed5e0210a13564b760c2efbb6a6400789ad92       10462  ./client/src/level/xml.rs
-78459fd801d3bfe9a087cb1b7e9e9ff979a8586b1fadefaad2900baa760cbd86       17597  ./client/src/main.rs
+9b4e7060dc1c78e1715643679a7900ad851543110412f0e4a5211ccb19ec54b5       17614  ./client/src/main.rs
 e4edf07b6066d40facd35ea17e089bfc5704ccf4e427098282a551ac7ce0e9b7        2317  ./client/src/network.rs
 f3d6ad7e8f15305b17977cd3a6c3f8a7155d13fa4c8fe3400fc6b65796c61449        6825  ./docs/LEVEL_FORMAT.md
 29fa343713c52cdf5b20c43334b8e0d64a14c0bd3f589da7b37f0e0ca890eab3        4214  ./docs/LUA_API.md
@@ -34,4 +34,5 @@ d1584ae38f3dc6b42a361aa42d2adefda3f7f94e5a97fb1804bc318ac6ef362f         131  ./
 3e18e70208ee460635e239a91c142cf67371feafb718b05617ff06f388bf96df          86  ./rust-toolchain.toml
 2e2170fc562f1d00b6699a75a93ee14f02172f502cd0239f7924ee462a8cb442         187  ./scripts/bootstrap_launcher.ps1
 f561e7e1072488367a8bcd068cd55d6f73b4bd8409aa46b276851526bd3c1b82         173  ./scripts/bootstrap_launcher.sh
-Updated: .github/workflows/release.yml now creates releases as YY.MM.DD-<7-char-commit-hash>.
+Updated: .github/workflows/release.yml creates releases as YY.MM.DD-<7-char-commit-hash>.
+Updated: Bevy ECS query filters prevent Transform aliasing panics in apply_lua_commands and sync_multiplayer.

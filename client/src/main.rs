@@ -360,7 +360,7 @@ fn sync_multiplayer(
     mut timer: ResMut<NetSendTimer>,
     player: Query<&Transform, With<Player>>,
     mut commands: Commands,
-    mut remotes: Query<(Entity, &RemotePlayer, &mut Transform)>,
+    mut remotes: Query<(Entity, &RemotePlayer, &mut Transform), Without<Player>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {

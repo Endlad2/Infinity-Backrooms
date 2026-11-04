@@ -1,0 +1,13 @@
+/target/
+**/.dart_tool/
+**/build/
+**/.flutter-plugins*
+**/pubspec.lock
+.idea/
+.vscode/
+.DS_Store
+*.log
+*.pdb
+*.zip
+*.tar.gz
+.backrooms_infinity/

@@ -549,7 +549,10 @@ fn apply_lua_commands(
     mut stats: ResMut<PlayerStats>,
     mut inventory: ResMut<Inventory>,
     mut state: ResMut<ChunkState>,
-    mut named: Query<(Entity, &LevelNamed, Option<&mut Visibility>, Option<&mut Transform>)>,
+    mut named: Query<
+        (Entity, &LevelNamed, Option<&mut Visibility>, Option<&mut Transform>),
+        (With<LevelOwned>, Without<Player>),
+    >,
     mut message: Query<&mut Text, With<LevelMessageText>>,
     mut message_timer: ResMut<MessageTimer>,
     level: Res<LoadedLevel>,
