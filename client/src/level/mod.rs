@@ -4,7 +4,7 @@ mod lua;
 mod runtime;
 
 pub use runtime::{LevelCollider, LevelRuntimePlugin};
-pub use schema::{LevelDefinition, PlayerDef};
+pub use schema::LevelDefinition;
 
 use anyhow::{anyhow, bail, Context, Result};
 use bevy::prelude::Resource;
@@ -97,7 +97,7 @@ fn extract_zip(archive_path: &Path, data_dir: Option<&Path>) -> Result<PathBuf> 
     let mut archive = ZipArchive::new(file).context("opening level zip")?;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
-        let Some(relative) = entry.enclosed_name().map(Path::to_path_buf) else {
+        let Some(relative) = entry.enclosed_name() else {
             bail!("unsafe path in level zip: {}", entry.name());
         };
         let target = output.join(relative);

@@ -253,7 +253,7 @@ fn spawn_chunk(
 
 fn spawn_box(
     commands: &mut Commands,
-    chunk: &ChunkDef,
+    _chunk: &ChunkDef,
     origin: Vec3,
     def: &BoxDef,
     render_assets: &LevelRenderAssets,
@@ -277,7 +277,7 @@ fn spawn_box(
 
 fn spawn_sphere(
     commands: &mut Commands,
-    chunk: &ChunkDef,
+    _chunk: &ChunkDef,
     origin: Vec3,
     def: &SphereDef,
     render_assets: &LevelRenderAssets,
@@ -301,7 +301,7 @@ fn spawn_sphere(
 
 fn spawn_cylinder(
     commands: &mut Commands,
-    chunk: &ChunkDef,
+    _chunk: &ChunkDef,
     origin: Vec3,
     def: &CylinderDef,
     render_assets: &LevelRenderAssets,
@@ -326,7 +326,7 @@ fn spawn_cylinder(
 
 fn spawn_model(
     commands: &mut Commands,
-    chunk: &ChunkDef,
+    _chunk: &ChunkDef,
     origin: Vec3,
     def: &ModelInstanceDef,
     definition: &LevelDefinition,
@@ -347,7 +347,7 @@ fn spawn_model(
     entity.id()
 }
 
-fn spawn_light(commands: &mut Commands, chunk: &ChunkDef, origin: Vec3, def: &LightDef) -> Entity {
+fn spawn_light(commands: &mut Commands, _chunk: &ChunkDef, origin: Vec3, def: &LightDef) -> Entity {
     let transform = world_transform(origin, &def.transform);
     let color = Color::srgb(def.color[0], def.color[1], def.color[2]);
     let mut entity = match def.kind {
@@ -381,7 +381,7 @@ fn spawn_light(commands: &mut Commands, chunk: &ChunkDef, origin: Vec3, def: &Li
 
 fn spawn_level_pickup(
     commands: &mut Commands,
-    chunk: &ChunkDef,
+    _chunk: &ChunkDef,
     origin: Vec3,
     def: &PickupDef,
     meshes: &mut Assets<Mesh>,
@@ -443,14 +443,18 @@ fn sync_lua_snapshot(
         selected_item,
         inventory_counts: counts,
     };
-    if let Ok(lua) = lua.0.lock() { lua.update_snapshot(snapshot); }
+    let lock = lua.0.lock();
+    if let Ok(lua) = lock {
+        lua.update_snapshot(snapshot);
+    }
 }
 
 fn lua_tick(time: Res<Time>, lua: Option<Res<LuaEngine>>, mut timer: ResMut<LuaTickTimer>) {
     timer.0.tick(time.delta());
     if !timer.0.just_finished() { return; }
     let Some(lua) = lua else { return; };
-    if let Ok(lua) = lua.0.lock() {
+    let lock = lua.0.lock();
+    if let Ok(lua) = lock {
         lua.dispatch("tick", &[("dt", EventValue::Number(timer.0.duration().as_secs_f64()))]);
     }
 }
@@ -516,6 +520,28 @@ fn interactable_system(
     }
 }
 
+fn remove_item_from_slots(slots: &mut [Option<ItemStack>], item: &str, count: &mut u16) {
+    for slot in slots {
+        if *count == 0 {
+            break;
+        }
+
+        let Some(stack) = slot.as_mut() else {
+            continue;
+        };
+        if stack.id != item {
+            continue;
+        }
+
+        let take = (*count).min(stack.count);
+        stack.count -= take;
+        *count -= take;
+        if stack.count == 0 {
+            *slot = None;
+        }
+    }
+}
+
 fn apply_lua_commands(
     mut commands: Commands,
     lua: Option<Res<LuaEngine>>,
@@ -551,15 +577,9 @@ fn apply_lua_commands(
                 let _ = inventory.insert_backpack(ItemStack { id: item, count });
             }
             LuaCommand::RemoveItem { item, mut count } => {
-                for slot in inventory.backpack.iter_mut().chain(inventory.hotbar.iter_mut()).chain(inventory.crafting.iter_mut()) {
-                    if count == 0 { break; }
-                    let Some(stack) = slot.as_mut() else { continue; };
-                    if stack.id != item { continue; }
-                    let take = count.min(stack.count);
-                    stack.count -= take;
-                    count -= take;
-                    if stack.count == 0 { *slot = None; }
-                }
+                remove_item_from_slots(&mut inventory.backpack, &item, &mut count);
+                remove_item_from_slots(&mut inventory.hotbar, &item, &mut count);
+                remove_item_from_slots(&mut inventory.crafting, &item, &mut count);
             }
             LuaCommand::SpawnBox { id, pos, size, rot_deg, material, collider } => {
                 let def = BoxDef {

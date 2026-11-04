@@ -73,7 +73,7 @@ fn main() {
         .add_plugins(DefaultPlugins
             .set(AssetPlugin { file_path: asset_root, ..default() })
             .set(WindowPlugin {
-                primary_window: Some(Window { title: "Backrooms Infinity".into(), resolution: (1280., 720.).into(), ..default() }),
+                primary_window: Some(Window { title: "Backrooms Infinity".into(), resolution: (1280_f32, 720_f32).into(), ..default() }),
                 ..default()
             }))
         .add_plugins(LevelRuntimePlugin)
@@ -247,7 +247,7 @@ fn update_slot_labels(inv: Res<Inventory>, slots: Query<(&InventorySlot, &Childr
     for (slot, children) in &slots {
         let value = inv.slots(slot.kind).get(slot.index).and_then(|x| x.as_ref());
         for child in children.iter() {
-            if let Ok(mut text) = labels.get_mut(child) {
+            if let Ok(mut text) = labels.get_mut(*child) {
                 **text = match value { Some(s) => format!("{} x{}", display_name(&s.id), s.count), None => "Empty".into() };
             }
         }

@@ -54,6 +54,9 @@ jobs:
       - name: Analyze
         working-directory: launcher
         run: flutter analyze
+      - name: Test launcher
+        working-directory: launcher
+        run: flutter test
       - name: Build Windows
         if: runner.os == 'Windows'
         working-directory: launcher
